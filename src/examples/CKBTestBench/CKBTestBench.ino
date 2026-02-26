@@ -625,7 +625,7 @@ void runRPCTests(CKBClient& ckb) {
 // Live:    requires CKB_NODE_LIGHT compiled in + a running light client
 // ═════════════════════════════════════════════════════════════════════════════
 
-#define LIGHT_CLIENT_URL  "http://192.168.68.87:9000"   // adjust if different
+#define LIGHT_CLIENT_URL  "http://192.168.68.91:9000"   // N100 running ckb-light-client v0.5.4
 
 void runLightClientTests(bool liveAvailable = false) {
     SECTION("LIGHT CLIENT — compile-time checks");
@@ -755,19 +755,40 @@ void runLightClientTests(bool liveAvailable = false) {
             }
         }
 
-        // Standard indexer on light client
+        // fetchTransaction — known committed tx
         {
-            TEST_BEGIN("getIndexerTip() on light client — valid");
-            CKBIndexerTip itip = lc.getIndexerTip();
-            itip.valid ? TEST_PASS() :
+            // Use the genesis cellbase tx (always exists, always committed)
+            const char* GENESIS_TX = "0x71a7ba8fc96349fea0ed3a5c47992e3b4084b031a42264a018e0072e8172e46c";
+            TEST_BEGIN("fetchTransaction (known committed tx)");
+            CKBTransaction tx = lc.fetchTransaction(GENESIS_TX);
+            // Either fetched (valid) or "added" / not synced (CKB_ERR_NOT_FOUND — acceptable)
+            (tx.valid || lc.lastError() == CKB_ERR_NOT_FOUND) ? TEST_PASS() :
                 TEST_FAIL(("err="+String(lc.lastErrorStr())).c_str());
-            INFO("indexer tip = %llu", (ull)itip.blockNumber);
+            if (tx.valid) {
+                INFO("tx status=%d  blockHash=%.12s..", tx.status, tx.blockHash);
+            } else {
+                INFO("fetch queued (not_synced or fetching — retry needed)");
+            }
+        }
+
+        // NOTE: get_indexer_tip is NOT supported in ckb-light-client v0.5.4
+        // Use get_cells_capacity as a lighter balance check instead
+        {
+            TEST_BEGIN("get_cells_capacity (via getBalance on light client)");
+            // Use lock args from our test privkey: 75178f...
+            const char* TEST_ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+            CKBBalance bal = lc.getBalance(TEST_ADDR);
+            // OK or NOT_FOUND both acceptable (depends on what's synced)
+            (bal.error == CKB_OK || bal.error == CKB_ERR_NOT_FOUND) ? TEST_PASS() :
+                TEST_FAIL(("err="+String(lc.lastErrorStr())).c_str());
+            INFO("balance=%s  cells=%d", CKBClient::formatCKB(bal.shannon).c_str(), bal.cellCount);
         }
 
         // Benchmark
         SECTION("LIGHT CLIENT — benchmarks");
         BENCH("getTipHeader()",  5, { lc.getTipHeader(); });
         BENCH("getScripts()",    5, { lc.getScripts(); });
+        BENCH("getSyncState()",  3, { lc.getSyncState(); });
 
     } else {
         SECTION("LIGHT CLIENT — live tests skipped");

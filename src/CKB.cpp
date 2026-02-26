@@ -1173,17 +1173,19 @@ CKBTransaction CKBClient::fetchTransaction(const char* txHash) {
     JsonDocument doc;
     if (!_rpcCall(_nodeUrl, "fetch_transaction", params, doc)) return out;
 
-    // fetch_transaction returns:
-    //   { status: "fetched", data: { transaction: {...}, time_added_to_pool: null,
-    //                                min_replace_fee: null, cycles: null,
-    //                                block_hash: "0x...", block_number: "0x...",
-    //                                tx_status: "committed" } }
-    //   or { status: "not_synced" } / { status: "fetching" }
+    // fetch_transaction v0.5.4 response:
+    //   { status: "fetched",
+    //     data: { transaction: {...},
+    //             cycles: null,
+    //             tx_status: { block_hash: "0x...", status: "committed" } } }
+    //   or { status: "added" }   — queued, not yet fetched
+    //   or { status: "not_synced" }
     JsonObject result = doc["result"];
     if (result.isNull()) { _lastError = CKB_ERR_NOT_FOUND; return out; }
 
     const char* status = result["status"] | "unknown";
     if (strcmp(status, "fetched") != 0) {
+        // "added" means it's queued — caller should retry
         _lastError = CKB_ERR_NOT_FOUND;
         return out;
     }
@@ -1194,17 +1196,19 @@ CKBTransaction CKBClient::fetchTransaction(const char* txHash) {
     JsonObject tx = data["transaction"];
     if (!tx.isNull()) out = _parseTransaction(tx);
 
-    // Enrich with block info from fetch response
-    const char* bh = data["block_hash"] | "";
-    const char* bn = data["block_number"] | "0x0";
-    if (strlen(bh) == 66) strncpy(out.blockHash, bh, sizeof(out.blockHash)-1);
-    out.blockNumber = hexToUint64(bn);
+    // tx_status is a nested object: { block_hash: "0x...", status: "committed" }
+    JsonObject txStatusObj = data["tx_status"].as<JsonObject>();
+    if (!txStatusObj.isNull()) {
+        const char* bh = txStatusObj["block_hash"] | "";
+        if (strlen(bh) == 66) strncpy(out.blockHash, bh, sizeof(out.blockHash)-1);
 
-    const char* txStatus = data["tx_status"] | "unknown";
-    if      (strcmp(txStatus,"pending")   == 0) out.status = 0;
-    else if (strcmp(txStatus,"proposed")  == 0) out.status = 1;
-    else if (strcmp(txStatus,"committed") == 0) out.status = 2;
+        const char* st = txStatusObj["status"] | "unknown";
+        if      (strcmp(st,"pending")   == 0) out.status = 0;
+        else if (strcmp(st,"proposed")  == 0) out.status = 1;
+        else if (strcmp(st,"committed") == 0) out.status = 2;
+    }
 
+    out.valid = true;
     return out;
 }
 
@@ -1213,7 +1217,7 @@ CKBTransaction CKBClient::fetchTransaction(const char* txHash) {
 CKBLightSyncState CKBClient::getSyncState() {
     CKBLightSyncState state; memset(&state, 0, sizeof(state));
 
-    // Light client tip = get_tip_header
+    // Get local synced tip from get_tip_header
     CKBBlockHeader tip = getTipHeader();
     if (!tip.valid) {
         state.error = _lastError;
@@ -1222,17 +1226,29 @@ CKBLightSyncState CKBClient::getSyncState() {
     state.tipBlockNumber = tip.number;
     strncpy(state.tipBlockHash, tip.hash, sizeof(state.tipBlockHash)-1);
 
-    // Compare against network tip from peer info
-    // local_node_info includes the synced tip
-    CKBNodeInfo info = getNodeInfo();
-    if (info.valid) {
-        // Consider synced if within 20 blocks of the network tip
-        uint64_t networkTip = info.tipBlockNumber;
-        state.isSynced = (networkTip <= state.tipBlockNumber + 20);
-    } else {
-        // Can't determine — assume not synced
-        state.isSynced = false;
+    // Light client v0.5.4: local_node_info does NOT include tipBlockNumber.
+    // Heuristic: if we have peers connected, the tip header advances with the network.
+    // Consider "synced" if we have at least 1 peer and the tip timestamp is recent
+    // (within ~30 minutes = 300 blocks at 6s each of the current time).
+    //
+    // Best available signal: timestamp of tip header vs system time.
+    // tip.timestamp is in milliseconds.
+    unsigned long nowMs = (unsigned long)millis(); // uptime only — not wall clock
+    // Without wall clock, we can only check peer connectivity as a proxy.
+    // If the node has connected peers, it is receiving new blocks.
+    JsonDocument doc;
+    bool hasPeers = false;
+    if (_rpcCall(_nodeUrl, "local_node_info", "[]", doc)) {
+        JsonObject info = doc["result"];
+        if (!info.isNull()) {
+            const char* connHex = info["connections"] | "0x0";
+            uint64_t conns = hexToUint64(connHex);
+            hasPeers = (conns > 0);
+        }
     }
+    // If we have peers and tip is non-zero, we're at least partially synced.
+    // Full sync detection requires knowing the network tip externally.
+    state.isSynced = hasPeers && (state.tipBlockNumber > 0);
 
     state.error = CKB_OK;
     return state;
