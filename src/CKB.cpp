@@ -191,6 +191,7 @@ CKBTransaction CKBClient::_parseTransaction(JsonObject obj) {
 }
 
 // ─── NODE RPC — Chain ─────────────────────────────────────────────────────────
+#if CKB_HAS_BLOCK_QUERIES
 
 uint64_t CKBClient::getTipBlockNumber() {
     StaticJsonDocument<256> doc;
@@ -290,7 +291,10 @@ CKBLiveCell CKBClient::getLiveCell(const char* txHash, uint32_t index, bool with
     return out;
 }
 
+#endif // CKB_HAS_BLOCK_QUERIES
+
 // ─── NODE RPC — Network ───────────────────────────────────────────────────────
+#if CKB_HAS_PEER_QUERIES
 
 CKBNodeInfo CKBClient::getNodeInfo() {
     CKBNodeInfo out; out.valid = false;
@@ -305,6 +309,11 @@ CKBNodeInfo CKBClient::getNodeInfo() {
     out.valid = strlen(out.nodeId) > 0;
     return out;
 }
+
+#endif // CKB_HAS_PEER_QUERIES
+
+// ─── NODE RPC — Tx Pool ───────────────────────────────────────────────────────
+#if CKB_HAS_POOL_QUERIES
 
 CKBTxPoolInfo CKBClient::getTxPoolInfo() {
     CKBTxPoolInfo out; out.valid = false;
@@ -348,7 +357,10 @@ uint8_t CKBClient::getPeers(CKBPeer peers[], uint8_t maxPeers) {
     return count;
 }
 
+#endif // CKB_HAS_POOL_QUERIES + CKB_HAS_PEER_QUERIES (getPeers ends here)
+
 // ─── INDEXER RPC ──────────────────────────────────────────────────────────────
+#if CKB_HAS_INDEXER
 
 CKBIndexerTip CKBClient::getIndexerTip() {
     CKBIndexerTip out; out.valid = false;
@@ -485,7 +497,9 @@ CKBTxsResult CKBClient::getRecentTransactions(const char* ckbAddress, uint8_t co
     return getTransactions(lock, "lock", "both", count);
 }
 
-// ─── Address decoder ──────────────────────────────────────────────────────────
+#endif // CKB_HAS_INDEXER
+
+// ─── Address decoder (always compiled) ───────────────────────────────────────
 
 static const char SECP256K1_CODE_HASH[] =
     "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8";
@@ -622,6 +636,41 @@ time_t CKBClient::msToTime(uint64_t timestampMs) {
     return (time_t)(timestampMs / 1000);
 }
 
+// ─── printConfig ──────────────────────────────────────────────────────────────
+
+void CKBClient::printConfig() {
+    Serial.println(F("── CKB-ESP32 v" CKB_ESP32_VERSION " build config ──────────────────────────────"));
+    Serial.printf("  Node type:     %s\n",   CKB_NODE_TYPE_STR);
+    Serial.printf("  Block queries: %s\n",   CKB_HAS_BLOCK_QUERIES ? "YES" : "no");
+    Serial.printf("  Peer queries:  %s\n",   CKB_HAS_PEER_QUERIES  ? "YES" : "no");
+    Serial.printf("  Pool queries:  %s\n",   CKB_HAS_POOL_QUERIES  ? "YES" : "no");
+    Serial.printf("  Indexer:       %s\n",   CKB_HAS_INDEXER       ? "YES" : "no");
+    Serial.printf("  Send tx:       %s\n",   CKB_HAS_SEND_TX       ? "YES" : "no");
+    Serial.printf("  Rich indexer:  %s\n",   CKB_HAS_RICH_INDEXER  ? "YES" : "no");
+    Serial.printf("  Signer:        %s\n",   CKB_HAS_SIGNER        ? "YES" : "no");
+#ifdef CKB_NODE_LIGHT
+    Serial.println("  Light client:  YES");
+#else
+    Serial.println("  Light client:  no");
+#endif
+    Serial.printf("  JSON buf:      %d bytes\n", CKB_JSON_DOC_SIZE);
+    Serial.printf("  Max cells:     %d\n",        CKB_MAX_CELLS);
+    Serial.printf("  Max txs:       %d\n",         CKB_MAX_TXS);
+    Serial.printf("  Max peers:     %d\n",         CKB_MAX_PEERS);
+    Serial.printf("  HTTP timeout:  %d ms\n",      CKB_HTTP_TIMEOUT_MS);
+    Serial.println(F("─────────────────────────────────────────────────────────────────────────"));
+}
+
+// ─── signTx (signer integration) ──────────────────────────────────────────────
+#if CKB_HAS_SIGNER
+
+CKBError CKBClient::signTx(CKBBuiltTx& tx, const CKBKey& key) {
+    CKBSigner signer(key);
+    return signer.signTx(tx);
+}
+
+#endif // CKB_HAS_SIGNER
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  TRANSACTION BUILDER IMPLEMENTATION
@@ -656,6 +705,9 @@ bool CKBClient::_buildWitnessHex(const uint8_t sig65[65], char* out, size_t outC
     _bytesToHex(witBuf, bWit.len, out);
     return true;
 }
+
+// ── Send / Build / Broadcast ──────────────────────────────────────────────────
+#if CKB_HAS_SEND_TX
 
 // ── collectInputCells ─────────────────────────────────────────────────────────
 
@@ -998,6 +1050,8 @@ CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeU
     if (txHashOut && strlen(hash) > 0) strncpy(txHashOut, hash, 67);
     return CKB_OK;
 }
+
+#endif // CKB_HAS_SEND_TX
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LIGHT CLIENT IMPLEMENTATION

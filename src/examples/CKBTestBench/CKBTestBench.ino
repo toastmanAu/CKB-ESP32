@@ -119,8 +119,68 @@ static const char* TV_B2B_EMPTY= "44f4c69744d5f8c55d642062949dcae49bc4e7ef43d388
 // signing_hash for tx_hash=0x00*32
 static const char* TV_SIGHASH  = "ca93f94edd259d66c58981134d7d79cd0a846127ded8fd0879b6111020675d0d";
 
-void runCryptoTests() {
-    // ── CKBKey load ───────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// SECTION 0 — BUILD CONFIGURATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+void runConfigTests() {
+    SECTION("BUILD CONFIG");
+    CKBClient::printConfig();
+
+    { TEST_BEGIN("version string non-empty");
+      strlen(CKB_ESP32_VERSION) > 0 ? TEST_PASS() : TEST_FAIL("empty version"); }
+
+    { TEST_BEGIN("node type string non-empty");
+      strlen(CKB_NODE_TYPE_STR) > 0 ? TEST_PASS() : TEST_FAIL("empty node type"); }
+
+    { TEST_BEGIN("CKB_JSON_DOC_SIZE >= 512");
+      CKB_JSON_DOC_SIZE >= 512 ? TEST_PASS() :
+          TEST_FAIL(("too small: " + String(CKB_JSON_DOC_SIZE)).c_str()); }
+
+    { TEST_BEGIN("CKB_MAX_CELLS >= 1");
+      CKB_MAX_CELLS >= 1 ? TEST_PASS() : TEST_FAIL("zero max cells"); }
+
+    { TEST_BEGIN("CKB_MAX_TXS >= 1");
+      CKB_MAX_TXS >= 1 ? TEST_PASS() : TEST_FAIL("zero max txs"); }
+
+    { TEST_BEGIN("CKB_HTTP_TIMEOUT_MS >= 1000");
+      CKB_HTTP_TIMEOUT_MS >= 1000 ? TEST_PASS() :
+          TEST_FAIL(("too short: " + String(CKB_HTTP_TIMEOUT_MS) + "ms").c_str()); }
+
+    // Capability coherence checks
+    { TEST_BEGIN("CKB_HAS_SIGNER is 0 or 1");
+      (CKB_HAS_SIGNER == 0 || CKB_HAS_SIGNER == 1) ? TEST_PASS() :
+          TEST_FAIL("unexpected value"); }
+
+    { TEST_BEGIN("CKB_HAS_INDEXER is 0 or 1");
+      (CKB_HAS_INDEXER == 0 || CKB_HAS_INDEXER == 1) ? TEST_PASS() :
+          TEST_FAIL("unexpected value"); }
+
+    // Profile-specific expectations
+#if defined(CKB_PROFILE_MINIMAL)
+    { TEST_BEGIN("MINIMAL: block queries disabled");
+      CKB_HAS_BLOCK_QUERIES == 0 ? TEST_PASS() : TEST_FAIL("should be disabled"); }
+    { TEST_BEGIN("MINIMAL: send tx disabled");
+      CKB_HAS_SEND_TX == 0 ? TEST_PASS() : TEST_FAIL("should be disabled"); }
+    { TEST_BEGIN("MINIMAL: JSON buf <= 4096");
+      CKB_JSON_DOC_SIZE <= 4096 ? TEST_PASS() :
+          TEST_FAIL(("too large for minimal: " + String(CKB_JSON_DOC_SIZE)).c_str()); }
+#endif
+#if defined(CKB_PROFILE_MONITOR)
+    { TEST_BEGIN("MONITOR: indexer disabled");
+      CKB_HAS_INDEXER == 0 ? TEST_PASS() : TEST_FAIL("should be disabled"); }
+    { TEST_BEGIN("MONITOR: block queries enabled");
+      CKB_HAS_BLOCK_QUERIES == 1 ? TEST_PASS() : TEST_FAIL("should be enabled"); }
+#endif
+#if defined(CKB_PROFILE_SIGNER)
+    { TEST_BEGIN("SIGNER: signer enabled");
+      CKB_HAS_SIGNER == 1 ? TEST_PASS() : TEST_FAIL("should be enabled"); }
+    { TEST_BEGIN("SIGNER: send tx enabled");
+      CKB_HAS_SEND_TX == 1 ? TEST_PASS() : TEST_FAIL("should be enabled"); }
+#endif
+}
+
+void runCryptoTests() {    // ── CKBKey load ───────────────────────────────────────────────────────────
     SECTION("CRYPTO — CKBKey");
 
     CHECK(({CKBKey k; k.loadPrivateKeyHex(TV_PRIV) && k.isValid();}),
@@ -838,6 +898,7 @@ void setup() {
         ESP.getCpuFreqMHz(), ESP.getFreeHeap());
 
     // ── Offline tests (always run) ─────────────────────────────────────────
+    runConfigTests();
     runCryptoTests();
     runUtilTests();
     runLightClientTests(false);   // offline struct/compile checks only
