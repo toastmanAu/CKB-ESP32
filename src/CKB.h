@@ -4,48 +4,116 @@
 /*
  * CKB-ESP32  —  Nervos CKB RPC library for ESP32 / Arduino
  *
- * Wraps CKB JSON-RPC + CKB Indexer RPC into clean C++ structs and functions.
+ * Wraps CKB JSON-RPC + Indexer RPC into clean C++ structs and functions.
+ * Supports full nodes, light clients, built-in indexer, and rich indexer.
  * Uses ArduinoJson + WiFiClient (HTTPClient). No external dependencies beyond
  * the Arduino ESP32 core.
  *
- * Supports:
- *   - CKB Node RPC  (get_tip_block_number, get_block_by_number, get_transaction,
- *                    get_live_cell, local_node_info, get_peers, tx_pool_info,
- *                    get_blockchain_info, get_epoch_by_number, calculate_dao_field)
- *   - CKB Indexer   (get_cells, get_transactions, get_cells_capacity,
- *                    get_indexer_tip)
- *   - Helpers       (shannonToCKB, hexToUint64, addrToLockScript, formatCKB)
+ * ── Node type selection ──────────────────────────────────────────────────────
+ * Define ONE of the following before including this header (or in platformio.ini):
+ *
+ *   #define CKB_NODE_FULL        // Full node (ckb) — default
+ *                                //   node RPC + built-in indexer (v0.100+)
+ *                                //   same URL for node + indexer
+ *
+ *   #define CKB_NODE_LIGHT       // Light node (ckb-light-client)
+ *                                //   subset of RPC — no block/peer queries
+ *                                //   has built-in indexer, same port
+ *
+ *   #define CKB_NODE_INDEXER     // Separate indexer process (legacy)
+ *                                //   node URL + separate indexer URL
+ *
+ *   #define CKB_NODE_RICH        // Rich-indexer (ckb-rich-indexer / Mercury)
+ *                                //   extended indexer API (get_balance, records)
+ *                                //   indexer URL points to rich indexer port
+ *
+ * Default if none defined: CKB_NODE_FULL
+ *
+ * ── Quick start ──────────────────────────────────────────────────────────────
+ * Full node (built-in indexer, same port):
+ *   CKBClient ckb("http://192.168.1.100:8114");
+ *
+ * Light client:
+ *   #define CKB_NODE_LIGHT
+ *   CKBClient ckb("http://192.168.1.100:9000");
+ *
+ * Separate indexer:
+ *   #define CKB_NODE_INDEXER
+ *   CKBClient ckb("http://192.168.1.100:8114", "http://192.168.1.100:8116");
+ *
+ * Rich indexer (Mercury):
+ *   #define CKB_NODE_RICH
+ *   CKBClient ckb("http://192.168.1.100:8114", "http://192.168.1.100:8116");
  *
  * Author:  toastmanAu  (Phill)
  * Repo:    https://github.com/toastmanAu/CKB-ESP32
  * License: MIT
- *
- * Quick start:
- *   CKBClient ckb("http://192.168.1.100:8114", "http://192.168.1.100:8116");
- *   uint64_t tip = ckb.getTipBlockNumber();
- *   CKBBalance bal = ckb.getBalance("ckb1qyq...");
  */
 
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
+#include "ckb_blake2b.h"
+#include "ckb_molecule.h"
+
+// ─── Node type guards ─────────────────────────────────────────────────────────
+#if !defined(CKB_NODE_FULL) && !defined(CKB_NODE_LIGHT) && \
+    !defined(CKB_NODE_INDEXER) && !defined(CKB_NODE_RICH)
+  #define CKB_NODE_FULL   // default
+#endif
+
+// Capabilities derived from node type
+#if defined(CKB_NODE_FULL)
+  #define CKB_HAS_BLOCK_QUERIES    1  // get_block, get_header, etc.
+  #define CKB_HAS_PEER_QUERIES     1  // get_peers, local_node_info
+  #define CKB_HAS_POOL_QUERIES     1  // tx_pool_info
+  #define CKB_HAS_INDEXER          1  // get_cells, get_cells_capacity
+  #define CKB_INDEXER_SAME_PORT    1  // indexer on same URL as node
+  #define CKB_HAS_SEND_TX          1
+  #define CKB_NODE_TYPE_STR        "full"
+#elif defined(CKB_NODE_LIGHT)
+  #define CKB_HAS_BLOCK_QUERIES    0  // light client has no block queries
+  #define CKB_HAS_PEER_QUERIES     0
+  #define CKB_HAS_POOL_QUERIES     0
+  #define CKB_HAS_INDEXER          1  // light client has built-in indexer
+  #define CKB_INDEXER_SAME_PORT    1
+  #define CKB_HAS_SEND_TX          1  // send_transaction supported
+  #define CKB_NODE_TYPE_STR        "light"
+#elif defined(CKB_NODE_INDEXER)
+  #define CKB_HAS_BLOCK_QUERIES    1
+  #define CKB_HAS_PEER_QUERIES     1
+  #define CKB_HAS_POOL_QUERIES     1
+  #define CKB_HAS_INDEXER          1
+  #define CKB_INDEXER_SAME_PORT    0  // separate indexer URL required
+  #define CKB_HAS_SEND_TX          1
+  #define CKB_NODE_TYPE_STR        "indexer"
+#elif defined(CKB_NODE_RICH)
+  #define CKB_HAS_BLOCK_QUERIES    1
+  #define CKB_HAS_PEER_QUERIES     1
+  #define CKB_HAS_POOL_QUERIES     1
+  #define CKB_HAS_INDEXER          1
+  #define CKB_HAS_RICH_INDEXER     1  // extended: get_balance, get_transaction_info
+  #define CKB_INDEXER_SAME_PORT    0
+  #define CKB_HAS_SEND_TX          1
+  #define CKB_NODE_TYPE_STR        "rich"
+#endif
 
 // ─── Version ──────────────────────────────────────────────────────────────────
-#define CKB_ESP32_VERSION      "1.0.0"
-#define CKB_ESP32_VERSION_MAJOR 1
+#define CKB_ESP32_VERSION      "2.0.0"
+#define CKB_ESP32_VERSION_MAJOR 2
 #define CKB_ESP32_VERSION_MINOR 0
 #define CKB_ESP32_VERSION_PATCH 0
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 #ifndef CKB_JSON_DOC_SIZE
-  #define CKB_JSON_DOC_SIZE    8192   // Increase for large blocks/tx lists
+  #define CKB_JSON_DOC_SIZE    8192
 #endif
 #ifndef CKB_HTTP_TIMEOUT_MS
   #define CKB_HTTP_TIMEOUT_MS  8000
 #endif
 #ifndef CKB_MAX_CELLS
-  #define CKB_MAX_CELLS        64     // Max cells returned in one Indexer query
+  #define CKB_MAX_CELLS        64
 #endif
 #ifndef CKB_MAX_TXS
   #define CKB_MAX_TXS          32
@@ -53,21 +121,42 @@
 #ifndef CKB_MAX_PEERS
   #define CKB_MAX_PEERS        16
 #endif
+#ifndef CKB_MAX_INPUTS
+  #define CKB_MAX_INPUTS       8    // Max inputs in a built transaction
+#endif
+#ifndef CKB_TX_BUF_SIZE
+  #define CKB_TX_BUF_SIZE      2048 // Molecule serialisation buffer (bytes)
+#endif
+#ifndef CKB_DEFAULT_FEE
+  #define CKB_DEFAULT_FEE      1000ULL  // 1000 shannon default fee
+#endif
+// Minimum cell capacity: 61 CKB for a secp256k1 output (61 bytes * 10^8)
+#define CKB_MIN_CELL_CAPACITY  6100000000ULL
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-#define CKB_SHANNON_PER_CKB    100000000ULL   // 1 CKB = 10^8 shannon
+#define CKB_SHANNON_PER_CKB    100000000ULL
 #define CKB_MAINNET_PREFIX     "ckb"
 #define CKB_TESTNET_PREFIX     "ckt"
+
+// secp256k1 dep group — these never change on mainnet/testnet
+#define CKB_SECP256K1_DEP_MAINNET_TX "0x71a7ba8fc96349fea0ed3a5c47992e3b4084b031a42264a018e0072e8172e46c"
+#define CKB_SECP256K1_DEP_TESTNET_TX "0xf8de3bb47d055cdf460d93a2a6e1b05f7432f9777c8c474abf4eec1d4aee5d37"
+#define CKB_SECP256K1_DEP_INDEX      0
+// secp256k1 lock code hash
+#define CKB_SECP256K1_CODE_HASH "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8"
 
 // ─── Error codes ──────────────────────────────────────────────────────────────
 typedef enum {
     CKB_OK              = 0,
-    CKB_ERR_HTTP        = -1,   // HTTP request failed
-    CKB_ERR_JSON        = -2,   // JSON parse error
-    CKB_ERR_RPC         = -3,   // RPC returned error field
-    CKB_ERR_NOT_FOUND   = -4,   // Resource not found (null result)
-    CKB_ERR_TIMEOUT     = -5,   // Request timed out
-    CKB_ERR_INVALID     = -6,   // Invalid argument
+    CKB_ERR_HTTP        = -1,
+    CKB_ERR_JSON        = -2,
+    CKB_ERR_RPC         = -3,
+    CKB_ERR_NOT_FOUND   = -4,
+    CKB_ERR_TIMEOUT     = -5,
+    CKB_ERR_INVALID     = -6,
+    CKB_ERR_UNSUPPORTED = -7,   // Operation not supported by this node type
+    CKB_ERR_FUNDS       = -8,   // Insufficient funds
+    CKB_ERR_OVERFLOW    = -9,   // Buffer overflow (increase CKB_TX_BUF_SIZE)
 } CKBError;
 
 // ─── Core data structures ─────────────────────────────────────────────────────
@@ -256,16 +345,127 @@ struct CKBIndexerTip {
     bool valid;
 };
 
+// ─── Transaction structures ───────────────────────────────────────────────────
+
+/** A cell dep (dependency) */
+struct CKBCellDepEntry {
+    char     txHash[67];
+    uint32_t index;
+    bool     isDepGroup;  // true = dep_group, false = code
+};
+
+/** A transaction input (previous output reference) */
+struct CKBTxInput {
+    char     txHash[67];
+    uint32_t index;
+    uint64_t since;       // usually 0x0
+    uint64_t capacity;    // capacity of the consumed cell (for fee calculation)
+    CKBScript lockScript; // lock of consumed cell (for change address)
+};
+
+/** A transaction output */
+struct CKBTxOutput {
+    uint64_t  capacity;          // shannon
+    CKBScript lockScript;        // recipient lock
+    bool      hasTypeScript;     // true if type field is set (DAO, UDT, etc.)
+    CKBScript typeScript;        // only valid if hasTypeScript
+    char      data[67];          // "0x" or hex data, usually "0x"
+};
+
+/**
+ * CKBBuiltTx — a fully populated CKB transaction object.
+ *
+ * This is the central transaction type. It holds all fields in a structured,
+ * readable form. You can inspect, modify, sign, and broadcast it independently.
+ *
+ * Workflow:
+ *   1. CKBBuiltTx tx = ckb.buildTransfer(from, to, amount)
+ *      — inputs selected from indexer, outputs calculated, deps set
+ *   2. Inspect: tx.signingHash, tx.txHashHex, tx.inputs[], tx.outputs[]
+ *   3. Sign:    tx.setSignature(sig65)   — inject secp256k1 signature
+ *   4. Broadcast: CKBClient::broadcast(tx, "http://node-ip:8114")
+ *      — any node, independent of where tx was built
+ *
+ * The tx object is fully self-contained. Pass it to any broadcast target.
+ */
+struct CKBBuiltTx {
+    // ── Inputs ────────────────────────────────────────────────────────────────
+    CKBTxInput inputs[CKB_MAX_INPUTS];
+    uint8_t    inputCount;
+
+    // ── Outputs ───────────────────────────────────────────────────────────────
+    CKBTxOutput outputs[CKB_MAX_INPUTS + 1];  // +1 for change
+    uint8_t     outputCount;
+
+    // ── Cell deps ─────────────────────────────────────────────────────────────
+    CKBCellDepEntry cellDeps[4];
+    uint8_t         cellDepCount;
+
+    // ── Signing ───────────────────────────────────────────────────────────────
+    // signingHash is what you pass to your signing function (secp256k1, P4, etc.)
+    uint8_t signingHash[32];
+
+    // txHash is the Blake2b hash of the serialised RawTransaction
+    uint8_t txHash[32];
+    char    txHashHex[67];   // "0x" + 64 hex chars + null
+
+    // ── Witness / signature ───────────────────────────────────────────────────
+    uint8_t signature[65];   // r[32] + s[32] + v[1], set by setSignature()
+    bool    signed_;         // true after setSignature() called
+
+    // ── Internals (kept for broadcast) ────────────────────────────────────────
+    uint8_t  _rawBytes[CKB_TX_BUF_SIZE];  // Molecule-serialised RawTransaction
+    size_t   _rawLen;
+
+    // ── Status ────────────────────────────────────────────────────────────────
+    CKBError error;
+    bool     valid;
+
+    /**
+     * Inject a secp256k1 signature (65 bytes: r[32]+s[32]+v[1]).
+     * Call this before broadcast().
+     * For SPHINCS+ or other schemes, use broadcastWithWitness() directly.
+     */
+    void setSignature(const uint8_t sig[65]) {
+        memcpy(signature, sig, 65);
+        signed_ = true;
+    }
+
+    /** Total input capacity */
+    uint64_t totalInputCapacity() const {
+        uint64_t t = 0;
+        for (uint8_t i = 0; i < inputCount; i++) t += inputs[i].capacity;
+        return t;
+    }
+
+    /** Total output capacity */
+    uint64_t totalOutputCapacity() const {
+        uint64_t t = 0;
+        for (uint8_t i = 0; i < outputCount; i++) t += outputs[i].capacity;
+        return t;
+    }
+
+    /** Fee = inputs - outputs */
+    uint64_t fee() const {
+        uint64_t in  = totalInputCapacity();
+        uint64_t out = totalOutputCapacity();
+        return (in > out) ? in - out : 0;
+    }
+};
+
 // ─── CKBClient class ──────────────────────────────────────────────────────────
 
 class CKBClient {
 public:
     /**
-     * @param nodeUrl    CKB node RPC URL  e.g. "http://192.168.1.100:8114"
-     * @param indexerUrl CKB indexer URL   e.g. "http://192.168.1.100:8116"
-     *                   (same as node for CKB >= v0.100 with built-in indexer)
+     * Constructor — adapts to node type at compile time.
+     *
+     * @param nodeUrl    CKB node RPC (or light client) URL
+     * @param indexerUrl Indexer URL — required for CKB_NODE_INDEXER/CKB_NODE_RICH
+     *                   Ignored for CKB_NODE_FULL/CKB_NODE_LIGHT (same port)
+     * @param testnet    Set true for testnet (affects secp256k1 dep group)
      */
-    CKBClient(const char* nodeUrl, const char* indexerUrl = nullptr);
+    CKBClient(const char* nodeUrl, const char* indexerUrl = nullptr, bool testnet = false);
 
     // ── Configuration ─────────────────────────────────────────────────────────
     void setTimeoutMs(uint32_t ms) { _timeoutMs = ms; }
@@ -420,14 +620,112 @@ public:
     /** Is a CKB address plausibly valid? */
     static bool isValidAddress(const char* address);
 
+    /** Which node type is compiled in? */
+    static const char* nodeTypeStr() { return CKB_NODE_TYPE_STR; }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  TRANSACTION BUILDER
+    //  Requires: CKB_HAS_INDEXER (all node types except raw node-only builds)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Build an unsigned CKB transfer transaction.
+     *
+     * Automatically:
+     *   - Queries indexer for live cells belonging to fromAddr
+     *   - Selects enough inputs to cover amount + fee
+     *   - Calculates change output
+     *   - Adds secp256k1 dep group cell dep
+     *   - Serialises to Molecule format
+     *   - Computes signing hash (Blake2b of tx + witness placeholder)
+     *
+     * Minimal required inputs — everything else is derived from the node.
+     *
+     * @param fromAddr     Sender CKB address (ckb1qyq... or ckt1qyq...)
+     * @param toAddr       Recipient CKB address
+     * @param amountShannon Amount to send in shannon (1 CKB = 10^8 shannon)
+     * @param feeShannon   Fee in shannon (default CKB_DEFAULT_FEE = 1000)
+     * @return CKBBuiltTx — check .valid and .error fields
+     *
+     * After receiving the result:
+     *   1. Sign result.signingHash[32] with your key
+     *   2. result.setSignature(sig65)
+     *   3. CKBClient::broadcast(result, "http://node-ip:8114")
+     */
+    CKBBuiltTx buildTransfer(const char* fromAddr,
+                              const char* toAddr,
+                              uint64_t    amountShannon,
+                              uint64_t    feeShannon = CKB_DEFAULT_FEE);
+
+    /**
+     * Broadcast a signed transaction to any CKB node.
+     *
+     * This is a static function — it does NOT require a CKBClient instance
+     * configured for any particular node. Pass any reachable node URL.
+     * The tx must have had setSignature() called first.
+     *
+     * @param tx          A signed CKBBuiltTx (call tx.setSignature() first)
+     * @param nodeUrl     CKB node RPC URL, e.g. "http://192.168.1.100:8114"
+     * @param txHashOut   Output buffer for the submitted tx hash (67 chars), or nullptr
+     * @param timeoutMs   HTTP timeout in ms (default: CKB_HTTP_TIMEOUT_MS)
+     * @return CKB_OK on success, error code otherwise
+     *
+     * Example:
+     *   CKBBuiltTx tx = ckb.buildTransfer(from, to, amount);
+     *   tx.setSignature(mySig);
+     *   char hash[67];
+     *   CKBError err = CKBClient::broadcast(tx, "http://192.168.68.87:8114", hash);
+     */
+    static CKBError broadcast(const CKBBuiltTx& tx,
+                               const char* nodeUrl,
+                               char* txHashOut = nullptr,
+                               uint32_t timeoutMs = CKB_HTTP_TIMEOUT_MS);
+
+    /**
+     * Broadcast with a custom raw witness (for non-secp256k1 signing schemes).
+     * witnessHex should be the full hex-encoded WitnessArgs molecule (e.g. SPHINCS+).
+     */
+    static CKBError broadcastWithWitness(const CKBBuiltTx& tx,
+                                          const char* nodeUrl,
+                                          const char* witnessHex,
+                                          char* txHashOut = nullptr,
+                                          uint32_t timeoutMs = CKB_HTTP_TIMEOUT_MS);
+
+    /**
+     * Collect live input cells for an address sufficient to cover targetShannon.
+     * Used internally by buildTransfer(), exposed for custom tx building.
+     *
+     * @param lockScript     Lock script of the sender
+     * @param targetShannon  Amount needed (amount + fee)
+     * @param outInputs      Output array of CKBTxInput (CKB_MAX_INPUTS capacity)
+     * @param outCount       Number of cells selected
+     * @param outTotal       Total capacity of selected cells
+     * @return CKB_OK, CKB_ERR_FUNDS, or error code
+     */
+    CKBError collectInputCells(const CKBScript& lockScript,
+                                uint64_t targetShannon,
+                                CKBTxInput outInputs[],
+                                uint8_t& outCount,
+                                uint64_t& outTotal);
+
 private:
     char _nodeUrl[128];
     char _indexerUrl[128];
     bool _hasIndexer;
+    bool _testnet;
     uint32_t _timeoutMs;
     bool _debug;
     CKBError _lastError;
     int _rpcId;
+
+    // Tx builder helpers
+    bool _buildRawTxMolecule(CKBBuiltTx& tx);
+    void _computeSigningHash(CKBBuiltTx& tx);
+    static void _bytesToHex(const uint8_t* bytes, size_t len, char* out);
+    static bool _buildWitnessHex(const uint8_t sig65[65], char* out, size_t outCap);
+    static bool _rpcCallStatic(const char* url, const char* method,
+                                const char* params, JsonDocument& doc,
+                                uint32_t timeoutMs);
 
     // Internal RPC caller
     bool _rpcCall(const char* url,

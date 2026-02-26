@@ -7,19 +7,29 @@
 
 // ─── Constructor ──────────────────────────────────────────────────────────────
 
-CKBClient::CKBClient(const char* nodeUrl, const char* indexerUrl) {
+CKBClient::CKBClient(const char* nodeUrl, const char* indexerUrl, bool testnet) {
     strncpy(_nodeUrl, nodeUrl, sizeof(_nodeUrl) - 1);
     _nodeUrl[sizeof(_nodeUrl) - 1] = '\0';
+    _testnet = testnet;
 
+#if CKB_INDEXER_SAME_PORT
+    // Full node / light client: indexer on same port
+    strncpy(_indexerUrl, nodeUrl, sizeof(_indexerUrl) - 1);
+    _indexerUrl[sizeof(_indexerUrl) - 1] = '\0';
+    (void)indexerUrl; // ignore
+#else
+    // Separate indexer or rich indexer
     if (indexerUrl && strlen(indexerUrl) > 0) {
         strncpy(_indexerUrl, indexerUrl, sizeof(_indexerUrl) - 1);
         _indexerUrl[sizeof(_indexerUrl) - 1] = '\0';
     } else {
-        // Default: indexer on same host, port 8116
+        // Fallback: try port 8116
         strncpy(_indexerUrl, nodeUrl, sizeof(_indexerUrl) - 1);
         char* port = strstr(_indexerUrl, ":8114");
         if (port) memcpy(port, ":8116", 5);
     }
+#endif
+
     _hasIndexer   = true;
     _timeoutMs    = CKB_HTTP_TIMEOUT_MS;
     _debug        = false;
@@ -29,14 +39,17 @@ CKBClient::CKBClient(const char* nodeUrl, const char* indexerUrl) {
 
 const char* CKBClient::lastErrorStr() const {
     switch (_lastError) {
-        case CKB_OK:            return "OK";
-        case CKB_ERR_HTTP:      return "HTTP error";
-        case CKB_ERR_JSON:      return "JSON parse error";
-        case CKB_ERR_RPC:       return "RPC error";
-        case CKB_ERR_NOT_FOUND: return "Not found";
-        case CKB_ERR_TIMEOUT:   return "Timeout";
-        case CKB_ERR_INVALID:   return "Invalid argument";
-        default:                return "Unknown error";
+        case CKB_OK:              return "OK";
+        case CKB_ERR_HTTP:        return "HTTP error";
+        case CKB_ERR_JSON:        return "JSON parse error";
+        case CKB_ERR_RPC:         return "RPC error";
+        case CKB_ERR_NOT_FOUND:   return "Not found";
+        case CKB_ERR_TIMEOUT:     return "Timeout";
+        case CKB_ERR_INVALID:     return "Invalid argument";
+        case CKB_ERR_UNSUPPORTED: return "Not supported by this node type";
+        case CKB_ERR_FUNDS:       return "Insufficient funds";
+        case CKB_ERR_OVERFLOW:    return "Buffer overflow — increase CKB_TX_BUF_SIZE";
+        default:                  return "Unknown error";
     }
 }
 
@@ -607,4 +620,381 @@ String CKBClient::formatCKBCompact(uint64_t shannon) {
 
 time_t CKBClient::msToTime(uint64_t timestampMs) {
     return (time_t)(timestampMs / 1000);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TRANSACTION BUILDER IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+void CKBClient::_bytesToHex(const uint8_t* bytes, size_t len, char* out) {
+    out[0] = '0'; out[1] = 'x';
+    for (size_t i = 0; i < len; i++) snprintf(out + 2 + i*2, 3, "%02x", bytes[i]);
+    out[2 + len*2] = '\0';
+}
+
+// Build WitnessArgs molecule with secp256k1 signature into hex string
+bool CKBClient::_buildWitnessHex(const uint8_t sig65[65], char* out, size_t outCap) {
+    uint8_t witBuf[128];
+    CKBBuf bWit; ckb_buf_init(&bWit, witBuf, sizeof(witBuf));
+    // WitnessArgs table: total(4) + 3 offsets(12) + lock fixvec(4+65)
+    const size_t lockFieldSz = 4 + 65;
+    const size_t headerSz    = 4 + 3*4;
+    const size_t totalSz     = headerSz + lockFieldSz;
+    ckb_buf_write_u32le(&bWit, (uint32_t)totalSz);
+    ckb_buf_write_u32le(&bWit, (uint32_t)headerSz);              // lock at offset 16
+    ckb_buf_write_u32le(&bWit, (uint32_t)(headerSz + lockFieldSz)); // input_type (absent)
+    ckb_buf_write_u32le(&bWit, (uint32_t)(headerSz + lockFieldSz)); // output_type (absent)
+    ckb_buf_write_u32le(&bWit, 65);                               // lock fixvec length
+    ckb_buf_write(&bWit, sig65, 65);                              // sig bytes
+
+    // hex-encode: "0x" + 2 chars per byte
+    size_t hexLen = 2 + bWit.len * 2 + 1;
+    if (hexLen > outCap) return false;
+    _bytesToHex(witBuf, bWit.len, out);
+    return true;
+}
+
+// ── collectInputCells ─────────────────────────────────────────────────────────
+
+CKBError CKBClient::collectInputCells(const CKBScript& lockScript,
+                                       uint64_t targetShannon,
+                                       CKBTxInput outInputs[],
+                                       uint8_t& outCount,
+                                       uint64_t& outTotal) {
+    outCount = 0; outTotal = 0;
+    char cursorBuf[128] = {0};
+    bool hasCursor = false;
+
+    while (outTotal < targetShannon && outCount < CKB_MAX_INPUTS) {
+        CKBCellsResult res = getCells(lockScript, "lock", 20,
+                                       hasCursor ? cursorBuf : nullptr);
+        if (res.error != CKB_OK || res.count == 0) break;
+
+        for (uint8_t i = 0; i < res.count && outCount < CKB_MAX_INPUTS; i++) {
+            CKBIndexerCell& c = res.cells[i];
+            if (c.output.capacity == 0) continue;
+            // Skip cells that have a type script (could be DAO, UDT — don't spend)
+            if (c.output.type.valid) continue;
+
+            CKBTxInput& inp = outInputs[outCount];
+            strncpy(inp.txHash, c.outPoint.txHash, 67);
+            inp.index      = c.outPoint.index;
+            inp.since      = 0;
+            inp.capacity   = c.output.capacity;
+            inp.lockScript = c.output.lock;
+            outCount++;
+            outTotal += c.output.capacity;
+            if (outTotal >= targetShannon) break;
+        }
+        if (!res.hasMore) break;
+        strncpy(cursorBuf, res.lastCursor, sizeof(cursorBuf) - 1);
+        hasCursor = true;
+    }
+
+    if (outTotal < targetShannon) { _lastError = CKB_ERR_FUNDS; return CKB_ERR_FUNDS; }
+    return CKB_OK;
+}
+
+// ── _buildRawTxMolecule ───────────────────────────────────────────────────────
+
+bool CKBClient::_buildRawTxMolecule(CKBBuiltTx& tx) {
+    // Each field serialised into its own stack buffer, then assembled into a table
+
+    // version (Uint32)
+    uint8_t vBuf[4]; CKBBuf bV; ckb_buf_init(&bV, vBuf, 4);
+    ckb_buf_write_u32le(&bV, 0);
+
+    // cell_deps: fixvec<CellDep> = 4-byte count + 37 bytes each
+    uint8_t depBuf[37*4 + 4]; CKBBuf bDep; ckb_buf_init(&bDep, depBuf, sizeof(depBuf));
+    ckb_buf_write_u32le(&bDep, tx.cellDepCount);
+    for (uint8_t i = 0; i < tx.cellDepCount; i++)
+        mol_write_celldep(&bDep, tx.cellDeps[i].txHash, tx.cellDeps[i].index, tx.cellDeps[i].isDepGroup);
+
+    // header_deps: empty fixvec
+    uint8_t hdBuf[4]; CKBBuf bHD; ckb_buf_init(&bHD, hdBuf, 4);
+    ckb_buf_write_u32le(&bHD, 0);
+
+    // inputs: fixvec<CellInput> = 4-byte count + 44 bytes each
+    uint8_t inBuf[44 * CKB_MAX_INPUTS + 4]; CKBBuf bIn; ckb_buf_init(&bIn, inBuf, sizeof(inBuf));
+    ckb_buf_write_u32le(&bIn, tx.inputCount);
+    for (uint8_t i = 0; i < tx.inputCount; i++)
+        mol_write_cellinput(&bIn, tx.inputs[i].txHash, tx.inputs[i].index, tx.inputs[i].since);
+
+    // outputs: dynvec<CellOutput>
+    // Build each CellOutput into its own temp, track offsets
+    uint8_t outItemBufs[CKB_MAX_INPUTS + 1][256];
+    size_t  outItemLens[CKB_MAX_INPUTS + 1];
+    for (uint8_t i = 0; i < tx.outputCount; i++) {
+        CKBBuf boi; ckb_buf_init(&boi, outItemBufs[i], 256);
+        mol_write_celloutput(&boi,
+            tx.outputs[i].capacity,
+            tx.outputs[i].lockScript.codeHash,
+            tx.outputs[i].lockScript.hashType,
+            tx.outputs[i].lockScript.args,
+            false);
+        outItemLens[i] = boi.len;
+    }
+    // dynvec: total(4) + offsets(4*n) + items
+    size_t dynvecOffsetsSz = 4 * tx.outputCount;
+    size_t dynvecDataSz = 0;
+    for (uint8_t i = 0; i < tx.outputCount; i++) dynvecDataSz += outItemLens[i];
+    size_t dynvecTotal = 4 + dynvecOffsetsSz + dynvecDataSz;
+
+    uint8_t outsBuf[512]; CKBBuf bOuts; ckb_buf_init(&bOuts, outsBuf, sizeof(outsBuf));
+    ckb_buf_write_u32le(&bOuts, (uint32_t)dynvecTotal);
+    size_t cursor = 4 + dynvecOffsetsSz;
+    for (uint8_t i = 0; i < tx.outputCount; i++) {
+        ckb_buf_write_u32le(&bOuts, (uint32_t)cursor);
+        cursor += outItemLens[i];
+    }
+    for (uint8_t i = 0; i < tx.outputCount; i++)
+        ckb_buf_write(&bOuts, outItemBufs[i], outItemLens[i]);
+
+    // outputs_data: dynvec<Bytes>  — each "0x" = empty fixvec (4-byte 0)
+    size_t odOffsetsSz = 4 * tx.outputCount;
+    size_t odItemSz    = 4;  // each empty fixvec
+    size_t odTotal     = 4 + odOffsetsSz + odItemSz * tx.outputCount;
+    uint8_t odBuf[128]; CKBBuf bOD; ckb_buf_init(&bOD, odBuf, sizeof(odBuf));
+    ckb_buf_write_u32le(&bOD, (uint32_t)odTotal);
+    for (uint8_t i = 0; i < tx.outputCount; i++)
+        ckb_buf_write_u32le(&bOD, (uint32_t)(4 + odOffsetsSz + i * odItemSz));
+    for (uint8_t i = 0; i < tx.outputCount; i++)
+        ckb_buf_write_u32le(&bOD, 0);  // empty bytes
+
+    // Assemble RawTransaction table
+    // Fields: version, cell_deps, header_deps, inputs, outputs, outputs_data
+    const size_t nFields  = 6;
+    const size_t hdrSz    = 4 + nFields * 4;  // total(4) + nFields offsets
+    size_t fieldLens[6]   = { bV.len, bDep.len, bHD.len, bIn.len, bOuts.len, bOD.len };
+    size_t fieldOffsets[6];
+    fieldOffsets[0] = hdrSz;
+    for (int i = 1; i < 6; i++) fieldOffsets[i] = fieldOffsets[i-1] + fieldLens[i-1];
+    size_t rawTotal = fieldOffsets[5] + fieldLens[5];
+
+    if (rawTotal > CKB_TX_BUF_SIZE) return false;
+
+    CKBBuf bRaw; ckb_buf_init(&bRaw, tx._rawBytes, CKB_TX_BUF_SIZE);
+    ckb_buf_write_u32le(&bRaw, (uint32_t)rawTotal);
+    for (int i = 0; i < 6; i++) ckb_buf_write_u32le(&bRaw, (uint32_t)fieldOffsets[i]);
+    ckb_buf_write(&bRaw, vBuf,    bV.len);
+    ckb_buf_write(&bRaw, depBuf,  bDep.len);
+    ckb_buf_write(&bRaw, hdBuf,   bHD.len);
+    ckb_buf_write(&bRaw, inBuf,   bIn.len);
+    ckb_buf_write(&bRaw, outsBuf, bOuts.len);
+    ckb_buf_write(&bRaw, odBuf,   bOD.len);
+
+    tx._rawLen = bRaw.len;
+    return (bRaw.len == rawTotal);
+}
+
+// ── _computeSigningHash ───────────────────────────────────────────────────────
+
+void CKBClient::_computeSigningHash(CKBBuiltTx& tx) {
+    // tx_hash = Blake2b(rawTx)
+    ckb_blake2b_hash(tx._rawBytes, tx._rawLen, tx.txHash);
+    _bytesToHex(tx.txHash, 32, tx.txHashHex);
+
+    // Witness placeholder: WitnessArgs with 65 zero bytes in lock field
+    uint8_t zeroSig[65] = {0};
+    char witHexBuf[300];
+    _buildWitnessHex(zeroSig, witHexBuf, sizeof(witHexBuf));
+    // witHexBuf = "0x<hex>" — strip prefix to get raw bytes for hashing
+    const char* witHex = witHexBuf + 2;
+    size_t witByteLen  = strlen(witHex) / 2;
+    uint8_t witBytes[128];
+    for (size_t i = 0; i < witByteLen && i < sizeof(witBytes); i++) {
+        char hi = witHex[i*2], lo = witHex[i*2+1];
+        auto nib = [](char c) -> uint8_t {
+            if (c>='0'&&c<='9') return c-'0';
+            if (c>='a'&&c<='f') return c-'a'+10;
+            if (c>='A'&&c<='F') return c-'A'+10;
+            return 0;
+        };
+        witBytes[i] = (nib(hi)<<4)|nib(lo);
+    }
+
+    // signing_hash = Blake2b(tx_hash || uint64le(witness_len) || witness_bytes)
+    CKB_Blake2b ctx;
+    ckb_blake2b_init(&ctx);
+    ckb_blake2b_update(&ctx, tx.txHash, 32);
+    uint64_t wlen = witByteLen;
+    uint8_t wlenBuf[8]; for (int i=0;i<8;i++) wlenBuf[i]=(uint8_t)(wlen>>(i*8));
+    ckb_blake2b_update(&ctx, wlenBuf, 8);
+    ckb_blake2b_update(&ctx, witBytes, witByteLen);
+    ckb_blake2b_final(&ctx, tx.signingHash);
+}
+
+// ── buildTransfer ─────────────────────────────────────────────────────────────
+
+CKBBuiltTx CKBClient::buildTransfer(const char* fromAddr, const char* toAddr,
+                                      uint64_t amountShannon, uint64_t feeShannon) {
+    CKBBuiltTx tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.valid = false;
+
+    // Validate
+    if (!fromAddr || !toAddr || amountShannon < CKB_MIN_CELL_CAPACITY) {
+        tx.error = CKB_ERR_INVALID; return tx;
+    }
+    CKBScript fromLock = decodeAddress(fromAddr);
+    CKBScript toLock   = decodeAddress(toAddr);
+    if (!fromLock.valid || !toLock.valid) { tx.error = CKB_ERR_INVALID; return tx; }
+
+    // 1. Collect inputs
+    uint64_t needed = amountShannon + feeShannon;
+    uint64_t totalIn = 0;
+    CKBError err = collectInputCells(fromLock, needed,
+                                      tx.inputs, tx.inputCount, totalIn);
+    if (err != CKB_OK) { tx.error = err; return tx; }
+
+    // 2. Calculate change
+    uint64_t change = totalIn - amountShannon - feeShannon;
+    bool hasChange  = (change >= CKB_MIN_CELL_CAPACITY);
+    if (!hasChange) feeShannon += change;  // absorb dust into fee
+
+    // 3. Build outputs
+    tx.outputCount = 0;
+    // Output 0: recipient
+    tx.outputs[0].capacity   = amountShannon;
+    tx.outputs[0].lockScript = toLock;
+    strncpy(tx.outputs[0].data, "0x", 3);
+    tx.outputCount = 1;
+    // Output 1: change (if significant)
+    if (hasChange) {
+        tx.outputs[1].capacity   = change;
+        tx.outputs[1].lockScript = fromLock;
+        strncpy(tx.outputs[1].data, "0x", 3);
+        tx.outputCount = 2;
+    }
+
+    // 4. Cell dep: secp256k1 dep group
+    tx.cellDepCount = 1;
+    strncpy(tx.cellDeps[0].txHash,
+            _testnet ? CKB_SECP256K1_DEP_TESTNET_TX : CKB_SECP256K1_DEP_MAINNET_TX, 67);
+    tx.cellDeps[0].index      = CKB_SECP256K1_DEP_INDEX;
+    tx.cellDeps[0].isDepGroup = true;
+
+    // 5. Serialise to Molecule
+    if (!_buildRawTxMolecule(tx)) { tx.error = CKB_ERR_OVERFLOW; return tx; }
+
+    // 6. Compute tx hash + signing hash
+    _computeSigningHash(tx);
+
+    tx.signed_ = false;
+    tx.error   = CKB_OK;
+    tx.valid   = true;
+    return tx;
+}
+
+// ── _rpcCallStatic ────────────────────────────────────────────────────────────
+
+bool CKBClient::_rpcCallStatic(const char* url, const char* method,
+                                 const char* params, JsonDocument& doc,
+                                 uint32_t timeoutMs) {
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(timeoutMs);
+
+    char body[2800];
+    snprintf(body, sizeof(body),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}",
+        method, params);
+
+    int code = http.POST(body);
+    if (code != 200) { http.end(); return false; }
+
+    DeserializationError jerr = deserializeJson(doc, http.getString());
+    http.end();
+    if (jerr) return false;
+    if (doc.containsKey("error")) return false;
+    return true;
+}
+
+// ── broadcast ────────────────────────────────────────────────────────────────
+
+CKBError CKBClient::broadcast(const CKBBuiltTx& tx, const char* nodeUrl,
+                                char* txHashOut, uint32_t timeoutMs) {
+    if (!tx.valid)   return CKB_ERR_INVALID;
+    if (!tx.signed_) return CKB_ERR_INVALID;  // must call setSignature() first
+
+    char witHex[300];
+    if (!_buildWitnessHex(tx.signature, witHex, sizeof(witHex))) return CKB_ERR_OVERFLOW;
+
+    return broadcastWithWitness(tx, nodeUrl, witHex, txHashOut, timeoutMs);
+}
+
+CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeUrl,
+                                           const char* witnessHex,
+                                           char* txHashOut, uint32_t timeoutMs) {
+    if (!tx.valid || !nodeUrl || !witnessHex) return CKB_ERR_INVALID;
+
+    // ── Build inputs JSON ─────────────────────────────────────────────────────
+    char inputsJson[600] = "[";
+    for (uint8_t i = 0; i < tx.inputCount; i++) {
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp),
+            "%s{\"previous_output\":{\"tx_hash\":\"%s\",\"index\":\"0x%x\"},\"since\":\"0x0\"}",
+            i > 0 ? "," : "",
+            tx.inputs[i].txHash, tx.inputs[i].index);
+        strncat(inputsJson, tmp, sizeof(inputsJson) - strlen(inputsJson) - 1);
+    }
+    strncat(inputsJson, "]", sizeof(inputsJson) - strlen(inputsJson) - 1);
+
+    // ── Build outputs JSON ────────────────────────────────────────────────────
+    char outputsJson[600] = "[";
+    char outputsDataJson[80] = "[";
+    for (uint8_t i = 0; i < tx.outputCount; i++) {
+        char capHex[20]; uint64ToHex(tx.outputs[i].capacity, capHex);
+        const CKBScript& lk = tx.outputs[i].lockScript;
+        char tmp[300];
+        snprintf(tmp, sizeof(tmp),
+            "%s{\"capacity\":\"%s\",\"lock\":{\"code_hash\":\"%s\",\"hash_type\":\"%s\",\"args\":\"%s\"},\"type\":null}",
+            i > 0 ? "," : "",
+            capHex, lk.codeHash, lk.hashType, lk.args);
+        strncat(outputsJson, tmp, sizeof(outputsJson) - strlen(outputsJson) - 1);
+        char dtmp[20]; snprintf(dtmp, sizeof(dtmp), "%s\"0x\"", i > 0 ? "," : "");
+        strncat(outputsDataJson, dtmp, sizeof(outputsDataJson) - strlen(outputsDataJson) - 1);
+    }
+    strncat(outputsJson, "]", sizeof(outputsJson) - strlen(outputsJson) - 1);
+    strncat(outputsDataJson, "]", sizeof(outputsDataJson) - strlen(outputsDataJson) - 1);
+
+    // ── Build cell_deps JSON ──────────────────────────────────────────────────
+    char depsJson[300] = "[";
+    for (uint8_t i = 0; i < tx.cellDepCount; i++) {
+        char tmp[200];
+        snprintf(tmp, sizeof(tmp),
+            "%s{\"out_point\":{\"tx_hash\":\"%s\",\"index\":\"0x%x\"},\"dep_type\":\"%s\"}",
+            i > 0 ? "," : "",
+            tx.cellDeps[i].txHash, tx.cellDeps[i].index,
+            tx.cellDeps[i].isDepGroup ? "dep_group" : "code");
+        strncat(depsJson, tmp, sizeof(depsJson) - strlen(depsJson) - 1);
+    }
+    strncat(depsJson, "]", sizeof(depsJson) - strlen(depsJson) - 1);
+
+    // ── Assemble send_transaction params ──────────────────────────────────────
+    char params[2600];
+    snprintf(params, sizeof(params),
+        "[{"
+        "\"version\":\"0x0\","
+        "\"cell_deps\":%s,"
+        "\"header_deps\":[],"
+        "\"inputs\":%s,"
+        "\"outputs\":%s,"
+        "\"outputs_data\":%s,"
+        "\"witnesses\":[\"%s\"]"
+        "},\"passthrough\"]",
+        depsJson, inputsJson, outputsJson, outputsDataJson, witnessHex);
+
+    JsonDocument doc;
+    if (!_rpcCallStatic(nodeUrl, "send_transaction", params, doc, timeoutMs)) {
+        return CKB_ERR_RPC;
+    }
+
+    const char* hash = doc["result"] | "";
+    if (txHashOut && strlen(hash) > 0) strncpy(txHashOut, hash, 67);
+    return CKB_OK;
 }
