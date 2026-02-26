@@ -620,6 +620,168 @@ void runRPCTests(CKBClient& ckb) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// SECTION 4 — LIGHT CLIENT (compile-time + optional live tests)
+// Offline: struct layout, serialisation helpers, address→script conversion
+// Live:    requires CKB_NODE_LIGHT compiled in + a running light client
+// ═════════════════════════════════════════════════════════════════════════════
+
+#define LIGHT_CLIENT_URL  "http://192.168.68.87:9000"   // adjust if different
+
+void runLightClientTests(bool liveAvailable = false) {
+    SECTION("LIGHT CLIENT — compile-time checks");
+
+    // ── Compile-time node type detection ─────────────────────────────────────
+    {
+        TEST_BEGIN("nodeTypeStr() returns a non-empty string");
+        const char* nt = CKBClient::nodeTypeStr();
+        (nt && strlen(nt) > 0) ? TEST_PASS() : TEST_FAIL("empty nodeTypeStr");
+        INFO("compiled node type = '%s'", nt);
+    }
+    {
+        TEST_BEGIN("nodeTypeStr() is one of the known types");
+        const char* nt = CKBClient::nodeTypeStr();
+        bool known = (strcmp(nt,"full")==0 || strcmp(nt,"light")==0 ||
+                      strcmp(nt,"indexer")==0 || strcmp(nt,"rich")==0);
+        known ? TEST_PASS() : TEST_FAIL(("unknown type: "+String(nt)).c_str());
+    }
+
+    // ── CKBScriptStatus struct layout ────────────────────────────────────────
+    {
+        TEST_BEGIN("CKBScriptStatus — zero-initialise + field assignment");
+        CKBScriptStatus s; memset(&s, 0, sizeof(s));
+        strncpy(s.scriptType, "lock", sizeof(s.scriptType)-1);
+        s.blockNumber = 18000000;
+        strncpy(s.script.codeHash,
+            "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
+            sizeof(s.script.codeHash)-1);
+        strncpy(s.script.hashType, "type", sizeof(s.script.hashType)-1);
+        strncpy(s.script.args, "0x75178f34549c5fe9cd1a0c57aebd01e7ddf9249e",
+            sizeof(s.script.args)-1);
+        s.script.valid = true;
+        (s.blockNumber == 18000000 && strcmp(s.scriptType,"lock")==0 && s.script.valid)
+            ? TEST_PASS() : TEST_FAIL("field assignment failed");
+    }
+
+    // ── watchAddress → decodeAddress round-trip ──────────────────────────────
+    // (offline: just verify address decodes to a valid script before calling RPC)
+    {
+        TEST_BEGIN("watchAddress address → lock script decode (offline check)");
+        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+        CKBScript lock = CKBClient::decodeAddress(ADDR);
+        (lock.valid && strncmp(lock.codeHash,"0x9bd7e06f",10)==0) ? TEST_PASS() :
+            TEST_FAIL("decodeAddress failed — watchAddress would fail too");
+    }
+
+    // ── Light client sync state struct ───────────────────────────────────────
+    {
+        TEST_BEGIN("CKBLightSyncState — zero-init and field access");
+        CKBLightSyncState st; memset(&st,0,sizeof(st));
+        st.tipBlockNumber = 18674521;
+        st.isSynced = false;
+        st.error = CKB_OK;
+        (st.tipBlockNumber == 18674521 && !st.isSynced && st.error == CKB_OK)
+            ? TEST_PASS() : TEST_FAIL("field access broken");
+    }
+
+#ifdef CKB_NODE_LIGHT
+    // ── Live light client tests ───────────────────────────────────────────────
+    if (liveAvailable) {
+        SECTION("LIGHT CLIENT — live RPC (#define CKB_NODE_LIGHT)");
+        CKBClient lc(LIGHT_CLIENT_URL);
+
+        // getTipHeader
+        {
+            TEST_BEGIN("getTipHeader() — valid, number > 0");
+            CKBBlockHeader tip = lc.getTipHeader();
+            (tip.valid && tip.number > 0) ? TEST_PASS() :
+                TEST_FAIL(("valid="+String(tip.valid)+" err="+lc.lastErrorStr()).c_str());
+            INFO("light tip = %llu  hash=%.12s..", (ull)tip.number, tip.hash);
+        }
+
+        // getSyncState
+        {
+            TEST_BEGIN("getSyncState() — no error");
+            CKBLightSyncState st = lc.getSyncState();
+            (st.error == CKB_OK) ? TEST_PASS() :
+                TEST_FAIL(("error="+String(lc.lastErrorStr())).c_str());
+            INFO("synced=%s  tipBlock=%llu", st.isSynced?"yes":"no", (ull)st.tipBlockNumber);
+        }
+
+        // getScripts (before registering — expect empty or existing)
+        {
+            TEST_BEGIN("getScripts() — no error");
+            CKBScriptStatusResult r = lc.getScripts();
+            (r.error == CKB_OK) ? TEST_PASS() :
+                TEST_FAIL(("error="+String(lc.lastErrorStr())).c_str());
+            INFO("registered scripts: %d", r.count);
+        }
+
+        // watchAddress
+        {
+            const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+            TEST_BEGIN("watchAddress() — registers lock script");
+            CKBError err = lc.watchAddress(ADDR, 0);
+            (err == CKB_OK) ? TEST_PASS() :
+                TEST_FAIL(("error code="+String((int)err)).c_str());
+        }
+
+        // getScripts after watching — should have at least 1
+        {
+            TEST_BEGIN("getScripts() after watchAddress — count >= 1");
+            CKBScriptStatusResult r = lc.getScripts();
+            (r.error == CKB_OK && r.count >= 1) ? TEST_PASS() :
+                TEST_FAIL(("count="+String(r.count)+" err="+String((int)r.error)).c_str());
+            for (int i = 0; i < r.count; i++) {
+                INFO("script[%d]: type=%s  blockNum=%llu  args=%.12s..",
+                     i, r.scripts[i].scriptType,
+                     (ull)r.scripts[i].blockNumber,
+                     r.scripts[i].script.args);
+            }
+        }
+
+        // fetchHeader for the tip block
+        {
+            CKBBlockHeader tip = lc.getTipHeader();
+            TEST_BEGIN("fetchHeader(tipHash) — fetched or syncing");
+            if (tip.valid && strlen(tip.hash) == 66) {
+                CKBBlockHeader h = lc.fetchHeader(tip.hash);
+                // Either fetched (valid) or "not_synced" / "fetching" (both OK for light client)
+                (h.valid || lc.lastError() == CKB_ERR_NOT_FOUND) ? TEST_PASS() :
+                    TEST_FAIL(("err="+String(lc.lastErrorStr())).c_str());
+                if (h.valid) INFO("fetched header #%llu", (ull)h.number);
+                else         INFO("fetch pending (not_synced or fetching)");
+            } else {
+                TEST_SKIP("tip header unavailable");
+            }
+        }
+
+        // Standard indexer on light client
+        {
+            TEST_BEGIN("getIndexerTip() on light client — valid");
+            CKBIndexerTip itip = lc.getIndexerTip();
+            itip.valid ? TEST_PASS() :
+                TEST_FAIL(("err="+String(lc.lastErrorStr())).c_str());
+            INFO("indexer tip = %llu", (ull)itip.blockNumber);
+        }
+
+        // Benchmark
+        SECTION("LIGHT CLIENT — benchmarks");
+        BENCH("getTipHeader()",  5, { lc.getTipHeader(); });
+        BENCH("getScripts()",    5, { lc.getScripts(); });
+
+    } else {
+        SECTION("LIGHT CLIENT — live tests skipped");
+        Serial.println("  [SKIP]  All live light client tests              (no light node at " LIGHT_CLIENT_URL ")");
+        _skip += 10;
+    }
+#else
+    SECTION("LIGHT CLIENT — live tests skipped");
+    Serial.println("  [SKIP]  All live light client tests              (compile with #define CKB_NODE_LIGHT)");
+    _skip += 10;
+#endif
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Main
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -657,6 +819,7 @@ void setup() {
     // ── Offline tests (always run) ─────────────────────────────────────────
     runCryptoTests();
     runUtilTests();
+    runLightClientTests(false);   // offline struct/compile checks only
 
     // ── Online tests (only if WiFi configured) ────────────────────────────
     if (strlen(WIFI_SSID) > 0) {
@@ -671,14 +834,17 @@ void setup() {
             Serial.printf("  Connected: %s\n", WiFi.localIP().toString().c_str());
             CKBClient ckb(CKB_NODE_URL);
             runRPCTests(ckb);
+            // Light client live tests — only run if CKB_NODE_LIGHT compiled in
+            // and you have a light client running at LIGHT_CLIENT_URL
+            runLightClientTests(true);
         } else {
             Serial.println("  [WARN] WiFi connection failed — skipping RPC tests");
-            _skip += 15;  // approximate number of RPC tests
+            _skip += 25;
         }
     } else {
         Serial.println("\n── RPC TESTS ─────────────────────────────────────────────");
         Serial.println("  [SKIP]  All RPC tests                                (WIFI_SSID not set)");
-        _skip += 15;
+        _skip += 25;
     }
 
     printSummary();

@@ -998,3 +998,256 @@ CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeU
     if (txHashOut && strlen(hash) > 0) strncpy(txHashOut, hash, 67);
     return CKB_OK;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIGHT CLIENT IMPLEMENTATION
+// Only compiled when #define CKB_NODE_LIGHT is set before including CKB.h
+// ─────────────────────────────────────────────────────────────────────────────
+#ifdef CKB_NODE_LIGHT
+
+/*
+ * Light client RPC reference:
+ *   set_scripts   — register scripts to watch (POST, params: [{script,script_type,block_number}], command)
+ *   get_scripts   — list watched scripts (POST, no params)
+ *   get_tip_header — current synced tip header (POST, no params)
+ *   fetch_header  — fetch header by hash on demand (POST, params: [blockHash])
+ *   fetch_transaction — fetch tx by hash (POST, params: [txHash])
+ *
+ * Standard methods also available on light client:
+ *   get_tip_block_number, local_node_info, get_peers, get_blockchain_info,
+ *   get_indexer_tip, get_cells, get_transactions, get_cells_capacity,
+ *   send_transaction (after sync)
+ */
+
+// ── setScripts ────────────────────────────────────────────────────────────────
+
+CKBError CKBClient::setScripts(const CKBScriptStatus* scripts, uint8_t count,
+                                 const char* command) {
+    if (!scripts || count == 0) return CKB_ERR_INVALID;
+
+    // Build JSON params:
+    // [[ {script:{code_hash,hash_type,args}, script_type, block_number}, ...], "command"]
+    // Max param string: ~300 bytes per script × 8 scripts + overhead
+    char param[3200];
+    char* p = param;
+    int remaining = sizeof(param);
+
+    int written = snprintf(p, remaining, "[[");
+    p += written; remaining -= written;
+
+    for (uint8_t i = 0; i < count && remaining > 10; i++) {
+        const CKBScriptStatus& s = scripts[i];
+        char blockNumHex[19];
+        uint64ToHex(s.blockNumber, blockNumHex);
+
+        written = snprintf(p, remaining,
+            "%s{"
+              "\"script\":{"
+                "\"code_hash\":\"%s\","
+                "\"hash_type\":\"%s\","
+                "\"args\":\"%s\""
+              "},"
+              "\"script_type\":\"%s\","
+              "\"block_number\":\"%s\""
+            "}",
+            i > 0 ? "," : "",
+            s.script.codeHash, s.script.hashType, s.script.args,
+            s.scriptType,
+            blockNumHex
+        );
+        p += written; remaining -= written;
+    }
+
+    written = snprintf(p, remaining, "],\"%s\"]", command);
+    p += written; remaining -= written;
+
+    JsonDocument doc;
+    if (!_rpcCall(_nodeUrl, "set_scripts", param, doc)) return _lastError;
+    return CKB_OK;
+}
+
+// ── watchAddress ──────────────────────────────────────────────────────────────
+
+CKBError CKBClient::watchAddress(const char* ckbAddress, uint64_t fromBlock) {
+    CKBScript lock = decodeAddress(ckbAddress);
+    if (!lock.valid) return CKB_ERR_INVALID;
+
+    CKBScriptStatus status;
+    memset(&status, 0, sizeof(status));
+    status.script      = lock;
+    status.blockNumber = fromBlock;
+    strncpy(status.scriptType, "lock", sizeof(status.scriptType)-1);
+
+    return setScripts(&status, 1, "partial");
+}
+
+// ── getScripts ────────────────────────────────────────────────────────────────
+
+CKBScriptStatusResult CKBClient::getScripts() {
+    CKBScriptStatusResult result;
+    memset(&result, 0, sizeof(result));
+
+    JsonDocument doc;
+    if (!_rpcCall(_nodeUrl, "get_scripts", "[]", doc)) {
+        result.error = _lastError;
+        return result;
+    }
+
+    JsonArray arr = doc["result"].as<JsonArray>();
+    if (arr.isNull()) {
+        result.error = CKB_ERR_JSON;
+        return result;
+    }
+
+    uint8_t idx = 0;
+    for (JsonObject item : arr) {
+        if (idx >= CKB_MAX_LIGHT_SCRIPTS) break;
+        CKBScriptStatus& s = result.scripts[idx];
+
+        JsonObject scriptObj = item["script"];
+        if (!scriptObj.isNull()) _parseScript(scriptObj, s.script);
+
+        const char* st = item["script_type"] | "lock";
+        strncpy(s.scriptType, st, sizeof(s.scriptType)-1);
+
+        const char* bn = item["block_number"] | "0x0";
+        s.blockNumber = hexToUint64(bn);
+
+        idx++;
+    }
+    result.count = idx;
+    result.error = CKB_OK;
+    return result;
+}
+
+// ── getTipHeader ──────────────────────────────────────────────────────────────
+
+CKBBlockHeader CKBClient::getTipHeader() {
+    JsonDocument doc;
+    CKBBlockHeader out; memset(&out, 0, sizeof(out));
+    if (!_rpcCall(_nodeUrl, "get_tip_header", "[]", doc)) return out;
+
+    JsonObject result = doc["result"];
+    if (result.isNull()) { _lastError = CKB_ERR_NOT_FOUND; return out; }
+    _parseBlockHeader(result, out);
+    return out;
+}
+
+// ── fetchHeader ───────────────────────────────────────────────────────────────
+
+CKBBlockHeader CKBClient::fetchHeader(const char* blockHash) {
+    CKBBlockHeader out; memset(&out, 0, sizeof(out));
+    if (!blockHash) { _lastError = CKB_ERR_INVALID; return out; }
+
+    char params[80];
+    snprintf(params, sizeof(params), "[\"%s\"]", blockHash);
+
+    JsonDocument doc;
+    if (!_rpcCall(_nodeUrl, "fetch_header", params, doc)) return out;
+
+    // fetch_header returns { status: "fetched", data: { header... } }
+    // or { status: "not_synced" } / { status: "fetching" }
+    JsonObject result = doc["result"];
+    if (result.isNull()) { _lastError = CKB_ERR_NOT_FOUND; return out; }
+
+    const char* status = result["status"] | "unknown";
+    if (strcmp(status, "fetched") == 0) {
+        JsonObject header = result["data"];
+        if (!header.isNull()) _parseBlockHeader(header, out);
+    } else {
+        // "not_synced" or "fetching" — not an error, just not ready
+        _lastError = CKB_ERR_NOT_FOUND;
+    }
+    return out;
+}
+
+// ── fetchTransaction ──────────────────────────────────────────────────────────
+
+CKBTransaction CKBClient::fetchTransaction(const char* txHash) {
+    CKBTransaction out; memset(&out, 0, sizeof(out)); out.status = 0;
+    if (!txHash) { _lastError = CKB_ERR_INVALID; return out; }
+
+    char params[80];
+    snprintf(params, sizeof(params), "[\"%s\"]", txHash);
+
+    JsonDocument doc;
+    if (!_rpcCall(_nodeUrl, "fetch_transaction", params, doc)) return out;
+
+    // fetch_transaction returns:
+    //   { status: "fetched", data: { transaction: {...}, time_added_to_pool: null,
+    //                                min_replace_fee: null, cycles: null,
+    //                                block_hash: "0x...", block_number: "0x...",
+    //                                tx_status: "committed" } }
+    //   or { status: "not_synced" } / { status: "fetching" }
+    JsonObject result = doc["result"];
+    if (result.isNull()) { _lastError = CKB_ERR_NOT_FOUND; return out; }
+
+    const char* status = result["status"] | "unknown";
+    if (strcmp(status, "fetched") != 0) {
+        _lastError = CKB_ERR_NOT_FOUND;
+        return out;
+    }
+
+    JsonObject data = result["data"];
+    if (data.isNull()) { _lastError = CKB_ERR_JSON; return out; }
+
+    JsonObject tx = data["transaction"];
+    if (!tx.isNull()) out = _parseTransaction(tx);
+
+    // Enrich with block info from fetch response
+    const char* bh = data["block_hash"] | "";
+    const char* bn = data["block_number"] | "0x0";
+    if (strlen(bh) == 66) strncpy(out.blockHash, bh, sizeof(out.blockHash)-1);
+    out.blockNumber = hexToUint64(bn);
+
+    const char* txStatus = data["tx_status"] | "unknown";
+    if      (strcmp(txStatus,"pending")   == 0) out.status = 0;
+    else if (strcmp(txStatus,"proposed")  == 0) out.status = 1;
+    else if (strcmp(txStatus,"committed") == 0) out.status = 2;
+
+    return out;
+}
+
+// ── getSyncState ──────────────────────────────────────────────────────────────
+
+CKBLightSyncState CKBClient::getSyncState() {
+    CKBLightSyncState state; memset(&state, 0, sizeof(state));
+
+    // Light client tip = get_tip_header
+    CKBBlockHeader tip = getTipHeader();
+    if (!tip.valid) {
+        state.error = _lastError;
+        return state;
+    }
+    state.tipBlockNumber = tip.number;
+    strncpy(state.tipBlockHash, tip.hash, sizeof(state.tipBlockHash)-1);
+
+    // Compare against network tip from peer info
+    // local_node_info includes the synced tip
+    CKBNodeInfo info = getNodeInfo();
+    if (info.valid) {
+        // Consider synced if within 20 blocks of the network tip
+        uint64_t networkTip = info.tipBlockNumber;
+        state.isSynced = (networkTip <= state.tipBlockNumber + 20);
+    } else {
+        // Can't determine — assume not synced
+        state.isSynced = false;
+    }
+
+    state.error = CKB_OK;
+    return state;
+}
+
+// ── waitForSync ───────────────────────────────────────────────────────────────
+
+bool CKBClient::waitForSync(uint64_t targetBlock, uint32_t timeoutMs, uint32_t pollMs) {
+    unsigned long deadline = millis() + timeoutMs;
+    while (millis() < deadline) {
+        CKBBlockHeader tip = getTipHeader();
+        if (tip.valid && tip.number >= targetBlock) return true;
+        if (pollMs > 0) delay(pollMs);
+    }
+    return false;
+}
+
+#endif // CKB_NODE_LIGHT

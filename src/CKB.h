@@ -345,6 +345,38 @@ struct CKBIndexerTip {
     bool valid;
 };
 
+// ─── Light client structures ──────────────────────────────────────────────────
+
+/**
+ * Script filter for light client set_scripts / get_scripts.
+ * The light client only syncs blocks relevant to registered scripts.
+ */
+struct CKBScriptStatus {
+    CKBScript script;
+    char      scriptType[7];    // "lock" or "type"
+    uint64_t  blockNumber;      // start syncing from this block (0 = genesis)
+};
+
+#define CKB_MAX_LIGHT_SCRIPTS 8
+
+/** Result of get_scripts */
+struct CKBScriptStatusResult {
+    CKBScriptStatus scripts[CKB_MAX_LIGHT_SCRIPTS];
+    uint8_t         count;
+    CKBError        error;
+};
+
+/**
+ * Light client sync state — returned by get_tip_header / local status.
+ * Shows which block the light client has synced to.
+ */
+struct CKBLightSyncState {
+    uint64_t tipBlockNumber;   // highest block synced
+    char     tipBlockHash[67];
+    bool     isSynced;         // true when tip is close to network tip
+    CKBError error;
+};
+
 // ─── Transaction structures ───────────────────────────────────────────────────
 
 /** A cell dep (dependency) */
@@ -622,6 +654,78 @@ public:
 
     /** Which node type is compiled in? */
     static const char* nodeTypeStr() { return CKB_NODE_TYPE_STR; }
+
+#if defined(CKB_NODE_LIGHT)
+    // ══════════════════════════════════════════════════════════════════════════
+    //  LIGHT CLIENT API
+    //  Only available when compiled with #define CKB_NODE_LIGHT
+    //
+    //  The CKB light client syncs only blocks relevant to registered scripts.
+    //  Workflow:
+    //    1. setScripts({your lock script}) — register addresses to watch
+    //    2. Wait for sync (poll getTipHeader until tipBlockNumber advances)
+    //    3. Use standard indexer methods: getBalance(), getCells(), getTransactions()
+    //    4. Use fetchTransaction() instead of getTransaction() for light client
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Register scripts for the light client to sync.
+     * The client will download and index all blocks containing these scripts.
+     *
+     * @param scripts    Array of script+type+startBlock entries
+     * @param count      Number of entries
+     * @param command    "all" (replace all), "partial" (merge with existing)
+     * @returns CKB_OK on success
+     */
+    CKBError setScripts(const CKBScriptStatus* scripts, uint8_t count,
+                         const char* command = "all");
+
+    /** Convenience: register a single lock script from a CKB address */
+    CKBError watchAddress(const char* ckbAddress, uint64_t fromBlock = 0);
+
+    /**
+     * Get the list of scripts currently registered with the light client.
+     * Useful to verify setScripts() took effect.
+     */
+    CKBScriptStatusResult getScripts();
+
+    /**
+     * Fetch the current tip block header from the light client.
+     * Lighter than getNodeInfo() — just the header.
+     * Use this to check sync progress.
+     */
+    CKBBlockHeader getTipHeader();
+
+    /**
+     * Fetch a specific block header by hash.
+     * Light client fetches it on demand if not already synced.
+     */
+    CKBBlockHeader fetchHeader(const char* blockHash);
+
+    /**
+     * Fetch a transaction from the light client.
+     * Returns the tx + its confirmation status (block hash/number).
+     * Use this instead of getTransaction() on light client builds.
+     *
+     * @param txHash    0x + 64 hex chars
+     */
+    CKBTransaction fetchTransaction(const char* txHash);
+
+    /**
+     * Get light client sync state — how far synced vs network tip.
+     * Polls get_tip_header and local_node_info to determine lag.
+     */
+    CKBLightSyncState getSyncState();
+
+    /**
+     * Block until the light client has synced to at least targetBlock.
+     * Polls every pollMs milliseconds, times out after timeoutMs.
+     * Returns true when synced, false on timeout.
+     */
+    bool waitForSync(uint64_t targetBlock, uint32_t timeoutMs = 60000,
+                     uint32_t pollMs = 2000);
+
+#endif // CKB_NODE_LIGHT
 
     // ══════════════════════════════════════════════════════════════════════════
     //  TRANSACTION BUILDER
