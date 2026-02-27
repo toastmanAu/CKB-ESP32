@@ -50,10 +50,12 @@ void setup() {
             (unsigned long long)epoch.startNumber,
             (unsigned long long)epoch.length);
         if (tip != UINT64_MAX && tip >= epoch.startNumber) {
+            uint64_t progress = tip - epoch.startNumber;
+            if (progress > epoch.length) progress = epoch.length;  // clamp at 100%
             Serial.printf("Progress:   block %llu / %llu (%.1f%%)\n",
-                (unsigned long long)(tip - epoch.startNumber),
+                (unsigned long long)progress,
                 (unsigned long long)epoch.length,
-                100.0 * (tip - epoch.startNumber) / epoch.length);
+                100.0 * progress / epoch.length);
         }
     }
 
