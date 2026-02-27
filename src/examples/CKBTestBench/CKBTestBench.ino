@@ -42,31 +42,55 @@
 #define CKB_NODE_URL   "http://192.168.68.87:8114"
 #define WIFI_TIMEOUT   10000
 
+// ─── Output target ────────────────────────────────────────────────────────────
+// Default: Serial. To redirect to Telegram (or any Print subclass), define this
+// before including the test bench, or change it here:
+//
+//   #include "TelegramSerial.h"
+//   TelegramSerial tg("ssid","pass","BOT_TOKEN","CHAT_ID", &Serial);
+//   #define CKB_TEST_OUTPUT tg
+//
+#ifndef CKB_TEST_OUTPUT
+  #define CKB_TEST_OUTPUT Serial
+#endif
+
+// printf-style helper for any Print subclass (Print doesn't have printf)
+static void _tbPrintf(Print& p, const char* fmt, ...) __attribute__((format(printf,2,3)));
+static void _tbPrintf(Print& p, const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    p.print(buf);
+}
+#define TB_PRINTF(fmt, ...) _tbPrintf(CKB_TEST_OUTPUT, fmt, ##__VA_ARGS__)
+
 // ─── Test framework ───────────────────────────────────────────────────────────
 static int  _pass = 0, _fail = 0, _skip = 0;
 static char _tname[64];
 static unsigned long _tstart;
 
 #define SECTION(name) \
-    Serial.printf("\n── %s ─────────────────────────────────────\n", name)
+    TB_PRINTF("\n── %s ─────────────────────────────────────\n", name)
 
 #define TEST_BEGIN(name) do { \
     strncpy(_tname,(name),sizeof(_tname)-1); _tstart=millis(); } while(0)
 
 // Expression-compatible versions — usable in ternary conditions
 inline void _testPass(int& p, const char* nm, unsigned long t0) {
-    p++; Serial.printf("  [PASS]  %-44s (%lums)\n", nm, millis()-t0); }
+    p++; TB_PRINTF("  [PASS]  %-44s (%lums)\n", nm, millis()-t0); }
 inline void _testFail(int& f, const char* nm, const char* msg) {
-    f++; Serial.printf("  [FAIL]  %-44s %s\n", nm, msg); }
+    f++; TB_PRINTF("  [FAIL]  %-44s %s\n", nm, msg); }
 inline void _testSkip(int& s, const char* nm, const char* r) {
-    s++; Serial.printf("  [SKIP]  %-44s (%s)\n", nm, r); }
+    s++; TB_PRINTF("  [SKIP]  %-44s (%s)\n", nm, r); }
 
 #define TEST_PASS() _testPass(_pass, _tname, _tstart)
 #define TEST_FAIL(msg) _testFail(_fail, _tname, (msg))
 #define TEST_SKIP(reason) _testSkip(_skip, _tname, (reason))
 
 #define INFO(fmt, ...) \
-    Serial.printf("  [INFO]  " fmt "\n", ##__VA_ARGS__)
+    TB_PRINTF("  [INFO]  " fmt "\n", ##__VA_ARGS__)
 
 #define CHECK(cond, name, failmsg) do { TEST_BEGIN(name); \
     if(cond) TEST_PASS(); else TEST_FAIL(failmsg); } while(0)
@@ -85,7 +109,7 @@ inline void _testSkip(int& s, const char* nm, const char* r) {
     unsigned long _t0=millis(); \
     for(int _bi=0;_bi<(iters);_bi++){__VA_ARGS__} \
     unsigned long _el=millis()-_t0; _pass++; \
-    Serial.printf("  [BENCH] %-44s %d\xc3\x97 %lums (~%luus/op)\n", \
+    TB_PRINTF("  [BENCH] %-44s %d\xc3\x97 %lums (~%luus/op)\n", \
         (label),(iters),_el,(_el*1000UL)/(unsigned long)(iters)); } while(0)
 
 typedef unsigned long long ull;
@@ -1000,12 +1024,12 @@ void runLightClientTests(bool liveAvailable = false) {
 
     } else {
         SECTION("LIGHT CLIENT — live tests skipped");
-        Serial.println("  [SKIP]  All live light client tests              (no light node at " LIGHT_CLIENT_URL ")");
+        CKB_TEST_OUTPUT.println("  [SKIP]  All live light client tests              (no light node at " LIGHT_CLIENT_URL ")");
         _skip += 10;
     }
 #else
     SECTION("LIGHT CLIENT — live tests skipped");
-    Serial.println("  [SKIP]  All live light client tests              (compile with #define CKB_NODE_LIGHT)");
+    CKB_TEST_OUTPUT.println("  [SKIP]  All live light client tests              (compile with #define CKB_NODE_LIGHT)");
     _skip += 10;
 #endif
 }
@@ -1016,32 +1040,32 @@ void runLightClientTests(bool liveAvailable = false) {
 
 void printSummary() {
     int total = _pass + _fail + _skip;
-    Serial.println("\n════════════════════════════════════════════════════════════");
-    Serial.println("  CKB-ESP32 TEST BENCH RESULTS");
-    Serial.println("════════════════════════════════════════════════════════════");
-    Serial.printf("  PASS:  %3d\n", _pass);
-    Serial.printf("  FAIL:  %3d\n", _fail);
-    Serial.printf("  SKIP:  %3d\n", _skip);
-    Serial.printf("  TOTAL: %3d\n", total);
+    CKB_TEST_OUTPUT.println("\n════════════════════════════════════════════════════════════");
+    CKB_TEST_OUTPUT.println("  CKB-ESP32 TEST BENCH RESULTS");
+    CKB_TEST_OUTPUT.println("════════════════════════════════════════════════════════════");
+    TB_PRINTF("  PASS:  %3d\n", _pass);
+    TB_PRINTF("  FAIL:  %3d\n", _fail);
+    TB_PRINTF("  SKIP:  %3d\n", _skip);
+    TB_PRINTF("  TOTAL: %3d\n", total);
     int passRate = total > 0 ? (_pass * 100) / total : 0;
-    Serial.printf("\n  Pass rate (excl. bench): %d%%\n", passRate);
-    Serial.printf("  Heap free: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
-    Serial.printf("  CPU freq:  %lu MHz\n",  (unsigned long)(ESP.getCpuFreqMHz()));
-    Serial.println(_fail == 0 ? "\n  ✓ ALL TESTS PASSED" : "\n  ✗ SOME TESTS FAILED — see [FAIL] lines above");
-    Serial.println("════════════════════════════════════════════════════════════\n");
+    TB_PRINTF("\n  Pass rate (excl. bench): %d%%\n", passRate);
+    TB_PRINTF("  Heap free: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    TB_PRINTF("  CPU freq:  %lu MHz\n",  (unsigned long)(ESP.getCpuFreqMHz()));
+    CKB_TEST_OUTPUT.println(_fail == 0 ? "\n  ✓ ALL TESTS PASSED" : "\n  ✗ SOME TESTS FAILED — see [FAIL] lines above");
+    CKB_TEST_OUTPUT.println("════════════════════════════════════════════════════════════\n");
 }
 
 // ── Test runner task — runs in a FreeRTOS task with 32KB stack ───────────────
 // The default Arduino loop task only has ~8KB which is too small for crypto tests.
 void testRunnerTask(void* pvParameters) {
-    Serial.println("\n╔══════════════════════════════════════════════════════════╗");
-    Serial.println("║           CKB-ESP32 Library Test Bench                  ║");
-    Serial.println("╚══════════════════════════════════════════════════════════╝");
-    Serial.printf("  Chip: %s  Rev: %d  Flash: %uMB  PSRAM: %uKB\n",
+    CKB_TEST_OUTPUT.println("\n╔══════════════════════════════════════════════════════════╗");
+    CKB_TEST_OUTPUT.println("║           CKB-ESP32 Library Test Bench                  ║");
+    CKB_TEST_OUTPUT.println("╚══════════════════════════════════════════════════════════╝");
+    TB_PRINTF("  Chip: %s  Rev: %d  Flash: %uMB  PSRAM: %uKB\n",
         ESP.getChipModel(), ESP.getChipRevision(),
         ESP.getFlashChipSize()/(1024*1024),
         ESP.getPsramSize()/1024);
-    Serial.printf("  CPU: %u MHz  Heap: %u bytes free\n",
+    TB_PRINTF("  CPU: %u MHz  Heap: %u bytes free\n",
         ESP.getCpuFreqMHz(), ESP.getFreeHeap());
 
     // ── Offline tests (always run) ─────────────────────────────────────────
@@ -1052,25 +1076,25 @@ void testRunnerTask(void* pvParameters) {
 
     // ── Online tests (only if WiFi configured) ────────────────────────────
     if (strlen(WIFI_SSID) > 0) {
-        Serial.printf("\n── WIFI — connecting to %s ...\n", WIFI_SSID);
+        TB_PRINTF("\n── WIFI — connecting to %s ...\n", WIFI_SSID);
         WiFi.begin(WIFI_SSID, WIFI_PASS);
         unsigned long t0 = millis();
         while (WiFi.status() != WL_CONNECTED && millis()-t0 < WIFI_TIMEOUT) {
-            delay(250); Serial.print(".");
+            delay(250); CKB_TEST_OUTPUT.print(".");
         }
-        Serial.println();
+        CKB_TEST_OUTPUT.println();
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("  Connected: %s\n", WiFi.localIP().toString().c_str());
+            TB_PRINTF("  Connected: %s\n", WiFi.localIP().toString().c_str());
             CKBClient ckb(CKB_NODE_URL);
             runRPCTests(ckb);
             runLightClientTests(true);
         } else {
-            Serial.println("  [WARN] WiFi connection failed — skipping RPC tests");
+            CKB_TEST_OUTPUT.println("  [WARN] WiFi connection failed — skipping RPC tests");
             _skip += 25;
         }
     } else {
-        Serial.println("\n── RPC TESTS ─────────────────────────────────────────────");
-        Serial.println("  [SKIP]  All RPC tests                                (WIFI_SSID not set)");
+        CKB_TEST_OUTPUT.println("\n── RPC TESTS ─────────────────────────────────────────────");
+        CKB_TEST_OUTPUT.println("  [SKIP]  All RPC tests                                (WIFI_SSID not set)");
         _skip += 25;
     }
 
