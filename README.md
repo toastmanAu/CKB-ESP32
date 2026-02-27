@@ -1,32 +1,70 @@
 # CKB-ESP32
 
-> Nervos CKB RPC library for ESP32 / Arduino
+> Embedded CKB SDK for Arduino — build, sign, and broadcast Nervos transactions directly from ESP32 hardware.
 
-Clean C++ wrapper around the CKB Node JSON-RPC and CKB Indexer JSON-RPC APIs. Drop it into any ESP32 project and query the Nervos blockchain in a few lines.
+No relay. No cloud. No custodian. The chip does everything.
 
-## Features
+[![Confirmed on Nervos Mainnet](https://img.shields.io/badge/mainnet-confirmed-brightgreen)](https://explorer.nervos.org/transaction/0x1db4d7677aaa03063ed87a6d927309b0ff4ce0bd18ec1f721432c11766f663d9)
 
-- **Node RPC** — tip block, block by number/hash, block header, transaction, live cell, epoch, tx pool, blockchain info, peers
-- **Indexer RPC** — `get_cells`, `get_transactions`, `get_cells_capacity`, `get_indexer_tip`
-- **High-level helpers** — `getBalance(address)`, `hasNewActivity()`, `getRecentTransactions()`
-- **Address decoding** — bech32/bech32m → lock script (short secp256k1 + full format)
-- **Formatting** — `formatCKB()`, `formatCKBCompact()`, `shannonToCKB()`
-- **Pagination** — full cursor-based pagination for cell/tx queries
-- **Type detection** — DAO, SUDT, xUDT cell identification in examples
-- Error handling with `CKBError` enum and `lastErrorStr()`
+---
 
-## Requirements
+## What it does
 
-- ESP32 (any variant with WiFi)
-- [ArduinoJson](https://arduinojson.org/) v7+
-- CKB full node with RPC enabled (port 8114)
-- CKB Indexer (built-in since CKB v0.100, port 8116) — for balance/cell queries
+A complete CKB transaction lifecycle runs entirely on-device:
 
-## Installation
+1. **Query** — fetch live cells and balance for any address (full node or light client)
+2. **Build** — collect UTXOs, calculate change, serialise to Molecule encoding
+3. **Sign** — secp256k1 RFC6979 deterministic signing, no external dependencies
+4. **Broadcast** — submit signed transaction to the network and confirm on-chain
+
+Tested on an ESP32-D0WD-V3 (classic dual-core, 240MHz) against Nervos mainnet.
+
+---
+
+## Architecture
+
+The library is split into independent modules, compiled only when needed:
+
+```
+CKBConfig.h       ← build profile selection (MINIMAL / DISPLAY / SIGNER / MONITOR / FULL)
+CKB.h / CKB.cpp   ← CKBClient: all RPC, transaction building, broadcasting
+CKBSigner.h/.cpp  ← on-device secp256k1 signing (trezor-crypto, pure C)
+ckb_molecule.h    ← Molecule serialisation (Script, Output, Transaction, WitnessArgs)
+ckb_blake2b.h     ← Blake2b-256 with CKB personalisation string
+```
+
+No ESP-IDF, no mbedTLS, no external registry dependencies.
+
+---
+
+## Build Profiles
+
+Select a profile in your sketch before `#include "CKB.h"` to control flash/RAM usage:
+
+| Profile | Use case | JSON buffer | Included |
+|---------|----------|-------------|----------|
+| `CKB_PROFILE_MINIMAL` | Light client, balance only | 2 KB | Light client RPC only |
+| `CKB_PROFILE_DISPLAY` | Node stats, balance display | 4 KB | Node + indexer RPC, no send |
+| `CKB_PROFILE_SIGNER` | Send transactions | 4 KB | Node + indexer + signer + send |
+| `CKB_PROFILE_MONITOR` | Block/peer/pool monitoring | 8 KB | Node + block + peer + pool, no send |
+| `CKB_PROFILE_FULL` | Everything | 16 KB | All modules |
+
+```cpp
+#define CKB_PROFILE_SIGNER   // pick one before the include
+#include "CKB.h"
+#include "CKBSigner.h"
+```
+
+Fine-grained control with `CKB_NO_*` and `CKB_WITH_*` defines — see `CKBConfig.h`.
+
+---
+
+## Quick Start
 
 ### PlatformIO
+
 ```ini
-[env:your_board]
+[env:esp32dev]
 platform = espressif32
 board = esp32dev
 framework = arduino
@@ -36,92 +74,175 @@ lib_deps =
 ```
 
 ### Arduino IDE
+
 Download ZIP → Sketch → Include Library → Add .ZIP Library
 
-## Quick Start
+---
+
+## Usage
+
+### Check balance
 
 ```cpp
-#include <WiFi.h>
+#define CKB_PROFILE_DISPLAY
 #include "CKB.h"
+#include <WiFi.h>
 
-CKBClient ckb("http://192.168.1.100:8114", "http://192.168.1.100:8116");
+CKBClient ckb("http://192.168.1.100:8114");
 
 void setup() {
-    // ... WiFi connect ...
+    // WiFi.begin(...) / waitForConnection ...
 
-    // Get tip block
-    uint64_t tip = ckb.getTipBlockNumber();
-    Serial.printf("Tip: %llu\n", tip);
-
-    // Get balance for an address
-    CKBBalance bal = ckb.getBalance("ckb1qyq...");
-    Serial.printf("Balance: %s\n", CKBClient::formatCKB(bal.shannon).c_str());
-
-    // Get recent transactions
-    CKBTxsResult txs = ckb.getRecentTransactions("ckb1qyq...", 5);
-    for (uint8_t i = 0; i < txs.count; i++) {
-        Serial.printf("Tx: %s @ block %llu\n",
-            txs.txs[i].txHash, txs.txs[i].blockNumber);
-    }
+    CKBBalance bal = ckb.getBalance("ckb1q...");
+    Serial.printf("Balance: %.4f CKB\n", CKBClient::shannonToCKB(bal.shannon));
 }
 ```
+
+### Send a transaction — one-shot
+
+```cpp
+#define CKB_PROFILE_SIGNER
+#include "CKB.h"
+#include "CKBSigner.h"
+
+// NOTE: load credentials from NVS in production — see Key Security section
+CKBClient ckb("http://192.168.1.100:8114");
+CKBKey key;
+
+void setup() {
+    key.loadPrivateKeyHex("your-private-key-hex");  // or load from NVS
+
+    char txHash[67] = {0};
+    CKBError err = ckb.sendTransaction(
+        "ckb1q...",   // recipient address
+        100.0f,        // amount in CKB
+        key,           // key — from address derived automatically
+        txHash         // optional: output buffer for tx hash
+    );
+
+    if (err == CKB_OK)
+        Serial.printf("Sent! TX: %s\n", txHash);
+}
+```
+
+### Send a transaction — manual (full control)
+
+```cpp
+// 1. Build
+CKBBuiltTx tx = ckb.buildTransfer(fromAddr, toAddr, CKBClient::ckbToShannon(100.0f));
+if (!tx.valid) { /* handle error */ }
+
+// 2. Sign
+if (ckb.signTx(tx, key) != CKB_OK) { /* handle error */ }
+
+// 3. Broadcast
+char txHash[67] = {0};
+CKBError err = CKBClient::broadcast(tx, NODE_URL, txHash);
+```
+
+### Light client (reduced bandwidth)
+
+```cpp
+#define CKB_PROFILE_MINIMAL
+#define CKB_NODE_LIGHT        // enables light client API
+#include "CKB.h"
+
+CKBClient ckb("http://192.168.1.100:9000");  // ckb-light-client port
+
+ckb.watchAddress("ckb1q...");
+ckb.waitForSync(30000);
+CKBBalance bal = ckb.getBalance("ckb1q...");
+```
+
+---
 
 ## API Reference
 
 ### CKBClient
 
 ```cpp
-CKBClient(const char* nodeUrl, const char* indexerUrl = nullptr);
+CKBClient(const char* nodeUrl, const char* indexerUrl = nullptr, bool testnet = false);
 ```
 
-**Node RPC — Chain**
+#### Node RPC — Chain
+
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getTipBlockNumber()` | `uint64_t` | Current tip block |
+| `getTipBlockNumber()` | `uint64_t` | Current tip block number |
 | `getBlockByNumber(n, verbose)` | `CKBBlock` | Block by number |
 | `getBlockByHash(hash, verbose)` | `CKBBlock` | Block by hash |
-| `getHeaderByNumber(n)` | `CKBBlockHeader` | Header only (lighter) |
+| `getHeaderByNumber(n)` | `CKBBlockHeader` | Header only |
 | `getHeaderByHash(hash)` | `CKBBlockHeader` | Header by hash |
 | `getCurrentEpoch()` | `CKBEpoch` | Current epoch info |
 | `getEpochByNumber(n)` | `CKBEpoch` | Epoch by number |
 
-**Node RPC — Transactions & Cells**
+#### Node RPC — Transactions & Cells
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getTransaction(txHash)` | `CKBTransaction` | Full transaction |
 | `getLiveCell(txHash, index)` | `CKBLiveCell` | Live cell at outpoint |
 
-**Node RPC — Network**
+#### Node RPC — Network
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getNodeInfo()` | `CKBNodeInfo` | Local node info |
-| `getTxPoolInfo()` | `CKBTxPoolInfo` | Mempool stats |
-| `getBlockchainInfo()` | `CKBChainInfo` | Chain info |
-| `getPeers(peers[], max)` | `uint8_t` | Connected peers |
+| `getTxPoolInfo()` | `CKBTxPoolInfo` | Mempool statistics |
+| `getBlockchainInfo()` | `CKBChainInfo` | Chain and sync info |
+| `getPeers(peers[], max)` | `uint8_t` | Connected peer count |
 
-**Indexer RPC**
+#### Indexer RPC
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getIndexerTip()` | `CKBIndexerTip` | Indexer sync tip |
-| `getCells(lockScript, ...)` | `CKBCellsResult` | Live cells for script |
-| `getTransactions(lockScript, ...)` | `CKBTxsResult` | Transactions for script |
-| `getCellsCapacity(lockScript)` | `CKBBalance` | Total capacity |
+| `getCells(lockScript, ...)` | `CKBCellsResult` | Live cells for a script |
+| `getTransactions(lockScript, ...)` | `CKBTxsResult` | Transactions for a script |
+| `getCellsCapacity(lockScript)` | `CKBBalance` | Total capacity sum |
 
-**High-level Helpers**
+#### High-level Helpers
+
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getBalance(address)` | `CKBBalance` | Balance for CKB address string |
+| `getBalance(address)` | `CKBBalance` | Balance for a CKB address |
+| `getBalance(key)` | `CKBBalance` | Balance derived from key (no address needed) |
 | `hasNewActivity(lockScript, &lastBlock)` | `bool` | True if new txs since last check |
-| `getRecentTransactions(address, n)` | `CKBTxsResult` | Last N txs for address |
+| `getRecentTransactions(address, n)` | `CKBTxsResult` | Last N transactions |
 
-**Static Utilities**
+#### Transaction Building & Sending
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `buildTransfer(from, to, shannon, fee)` | `CKBBuiltTx` | Build unsigned transaction |
+| `signTx(tx, key)` | `CKBError` | Sign in-place (secp256k1-blake160) |
+| `broadcast(tx, nodeUrl, txHashOut)` | `CKBError` | Submit pre-signed transaction |
+| `sendTransaction(to, amountCKB, key, txHashOut)` | `CKBError` | One-shot: build + sign + broadcast |
+
+#### Static Utilities
+
 | Method | Description |
 |--------|-------------|
 | `decodeAddress(address)` | CKB address → `CKBScript` |
-| `formatCKB(shannon)` | `"1,234.56 CKB"` |
+| `encodeAddress(lockScript, mainnet)` | `CKBScript` → bech32m address |
+| `ckbToShannon(ckb)` | `float` CKB → `uint64_t` shannon |
+| `shannonToCKB(shannon)` | `uint64_t` → `float` |
+| `formatCKB(shannon)` | `"1,234.5600 CKB"` |
 | `formatCKBCompact(shannon)` | `"1.2K CKB"` |
-| `shannonToCKB(shannon)` | float |
-| `hexToUint64(hex)` | `"0x1a2b"` → uint64 |
+| `hexToUint64(hex)` | `"0x1a2b"` → `uint64_t` |
+
+#### Light Client API (`#define CKB_NODE_LIGHT`)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `setScripts(scripts[], count)` | `CKBError` | Register scripts to watch |
+| `watchAddress(address)` | `CKBError` | Watch a single address |
+| `getSyncState()` | `CKBSyncState` | Current sync progress |
+| `waitForSync(timeoutMs)` | `CKBError` | Block until synced |
+| `getTipHeader()` | `CKBBlockHeader` | Light client tip |
+| `fetchTransaction(txHash)` | `bool` | Fetch tx from the network |
+
+---
 
 ## Data Structures
 
@@ -132,35 +253,49 @@ struct CKBBalance   { uint64_t shannon; float ckb; uint32_t cellCount; CKBError 
 struct CKBBlock     { CKBBlockHeader header; uint32_t txCount; char minerLockArgs[43]; bool valid; };
 struct CKBEpoch     { uint64_t number; uint64_t startNumber; uint64_t length; bool valid; };
 struct CKBNodeInfo  { char nodeId[53]; char version[24]; uint64_t tipBlockNumber; uint32_t peersCount; bool valid; };
-struct CKBCellsResult { CKBIndexerCell cells[64]; uint8_t count; char lastCursor[67]; bool hasMore; };
-struct CKBTxsResult   { CKBIndexerTx txs[32]; uint8_t count; bool hasMore; CKBError error; };
+struct CKBCellsResult { CKBIndexerCell cells[CKB_MAX_CELLS]; uint8_t count; char lastCursor[67]; bool hasMore; };
+struct CKBTxsResult   { CKBIndexerTx  txs[CKB_MAX_TXS];    uint8_t count; bool hasMore; CKBError error; };
+
+struct CKBBuiltTx {
+    bool     valid;
+    bool     signed_;
+    uint8_t  inputCount;
+    uint8_t  outputCount;
+    uint64_t fee();              // computed from inputs - outputs
+    uint8_t  txHash[32];         // Blake2b hash of raw tx (no witnesses)
+    uint8_t  signingHash[32];    // hash the lock script verifies
+    uint8_t  signature[65];      // [r(32) | s(32) | recid(1)] after signing
+    CKBError error;
+};
 ```
 
-## Configuration
+---
 
-Override before including `CKB.h`:
+## CKBSigner
+
 ```cpp
-#define CKB_JSON_DOC_SIZE   16384  // Increase for verbose block queries
-#define CKB_HTTP_TIMEOUT_MS 10000
-#define CKB_MAX_CELLS       64
-#define CKB_MAX_TXS         32
+#include "CKBSigner.h"
+
+// Load a key
+CKBKey key;
+key.loadPrivateKeyHex("64-char-hex");    // from hex string
+key.loadPrivateKeyBytes(bytes, 32);      // from raw bytes
+
+// Derive the address (no need to hardcode it)
+char addr[120];
+key.getAddress(addr, sizeof(addr), true);   // true = mainnet
+
+// Check lock args (what goes in the lock script)
+char args[42];
+key.getLockArgsHex(args, sizeof(args));     // "0x4454b23e..."
+
+// Clear key material from RAM
+key.clear();
 ```
 
-## Examples
+Signing uses [trezor-crypto](https://github.com/trezor/trezor-firmware/tree/master/crypto) vendored in `src/crypto/`. RFC6979 deterministic k, secp256k1 curve, Blake2b-256 signing hash.
 
-| Example | Description |
-|---------|-------------|
-| `BasicNodeInfo` | Tip, chain info, epoch, peers, latest block |
-| `WatchAddress` | Poll for incoming payments, print amounts |
-| `IndexerCells` | Paginate all cells, detect DAO/SUDT/xUDT |
-
-## Use Cases
-
-- **BlackBox POS** — watch merchant address for payment confirmation
-- **Price/stats display** — show tip block, tx count, pool size on TFT
-- **NerdMiner** — display live network stats alongside mining info
-- **Wallet display** — show balance on e-ink or OLED
-- **Whale watcher** — alert on large transfers (ESP32 + buzzer)
+---
 
 ## Key Security on ESP32
 
@@ -218,8 +353,8 @@ combo, PIN pad, BLE, serial prompt). The key exists in RAM only for the duration
 ```cpp
 #include "mbedtls/sha256.h"
 
-// Derive a deterministic private key from a passphrase + salt
-// NOT BIP39 — simple SHA-256 stretch. Use for low-value / demo builds only.
+// Derive a deterministic private key from a passphrase + salt.
+// For production use a proper KDF (PBKDF2 via mbedtls/pkcs5.h) with high iteration count.
 bool deriveKey(const char* passphrase, const char* salt, CKBKey& key) {
     uint8_t digest[32];
     char combined[128];
@@ -231,9 +366,6 @@ bool deriveKey(const char* passphrase, const char* salt, CKBKey& key) {
     return key.loadPrivateKeyHex(hexKey);
 }
 ```
-
-For a production passphrase-derived key use a proper KDF (PBKDF2, scrypt, or Argon2)
-with a high iteration count — mbedTLS includes PBKDF2 via `mbedtls/pkcs5.h`.
 
 **Wipe the key when done:**
 ```cpp
@@ -252,14 +384,14 @@ static uint64_t dailySent = 0;
 static uint32_t dayStart  = 0;
 
 CKBError guardedSend(CKBClient& ckb, const char* to, float amountCKB, const CKBKey& key) {
-    const uint64_t MAX_TX_SHANNON   = CKBClient::ckbToShannon(100.0f);  // 100 CKB per tx
-    const uint64_t MAX_DAILY_SHANNON = CKBClient::ckbToShannon(500.0f); // 500 CKB/day
+    const uint64_t MAX_TX_SHANNON    = CKBClient::ckbToShannon(100.0f);
+    const uint64_t MAX_DAILY_SHANNON = CKBClient::ckbToShannon(500.0f);
 
     uint64_t shannon = CKBClient::ckbToShannon(amountCKB);
     if (shannon > MAX_TX_SHANNON) return CKB_ERR_INVALID;
 
     uint32_t now = millis() / 1000;
-    if (now - dayStart > 86400) { dailySent = 0; dayStart = now; }  // reset daily
+    if (now - dayStart > 86400) { dailySent = 0; dayStart = now; }
     if (dailySent + shannon > MAX_DAILY_SHANNON) return CKB_ERR_INVALID;
 
     CKBError err = ckb.sendTransaction(to, amountCKB, key);
@@ -306,6 +438,57 @@ For the highest security on ESP32-class hardware, pair the library with an
 **ATECC608A/B** secure element (I²C). The private key never leaves the secure element;
 signing happens on-chip. The `CKBSigner` module can accept a pre-computed signature from
 any source via `CKBBuiltTx::setSignature()`.
+
+---
+
+## Use Cases
+
+| Project | Description |
+|---------|-------------|
+| **CKB POS terminal** | Watch for incoming payments, auto-settle to another address |
+| **NerdMiner CKB** | Show live network stats (tip, peers, pool) alongside mining |
+| **Whale watcher** | Alert on large transfers via buzzer or display |
+| **Hardware wallet** | Sign CKB transactions with keys stored in secure element |
+| **IoT micro-payments** | Devices pay-per-use autonomously |
+| **ESP32 POS + Quantum Purse** | Compatible with SPHINCS+ signing via `setSignature()` |
+
+---
+
+## Requirements
+
+- ESP32 (any variant with WiFi; tested on ESP32-D0WD-V3)
+- [ArduinoJson](https://arduinojson.org/) v7+
+- CKB full node (port 8114) or [ckb-light-client](https://github.com/nervosnetwork/ckb-light-client) (port 9000)
+
+---
+
+## Examples
+
+| Example | Profile | Description |
+|---------|---------|-------------|
+| `BasicNodeInfo` | DISPLAY | Tip, chain info, epoch, peers, latest block |
+| `WatchAddress` | DISPLAY | Poll for incoming payments, print amounts |
+| `IndexerCells` | DISPLAY | Paginate all cells, detect DAO/SUDT/xUDT |
+| `TransferCKB` | SIGNER | Build, sign, and broadcast a transfer |
+| `LightClientSync` | MINIMAL | Light client sync + balance check |
+
+---
+
+## Stack note
+
+Transaction building and cryptographic operations require stack space beyond the Arduino
+default (8 KB). Run CKB operations in a dedicated FreeRTOS task with at least 32 KB:
+
+```cpp
+void ckbTask(void*) {
+    // ... CKB operations ...
+    vTaskDelete(nullptr);
+}
+
+void setup() {
+    xTaskCreatePinnedToCore(ckbTask, "ckb", 32768, nullptr, 1, nullptr, 1);
+}
+```
 
 ---
 
