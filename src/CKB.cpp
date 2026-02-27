@@ -665,8 +665,7 @@ void CKBClient::printConfig() {
 #if CKB_HAS_SIGNER
 
 CKBError CKBClient::signTx(CKBBuiltTx& tx, const CKBKey& key) {
-    CKBSigner signer(key);
-    return signer.signTx(tx);
+    return CKBSigner::signTx(tx, key) ? CKB_OK : CKB_ERR_INVALID;
 }
 
 #endif // CKB_HAS_SIGNER

@@ -59,7 +59,8 @@
 #include "CKBConfig.h"   // node type, profiles, capability flags, buffer sizes
 
 #if CKB_HAS_SIGNER
-  #include "CKBSigner.h"  // CKBKey, CKBSigner — adds ~15KB flash
+  // Included AFTER all CKB structs are defined (see bottom of class section)
+  // so CKBSigner.h can use CKBBuiltTx, CKBKey etc without redefinition issues.
 #endif
 
 // ─── Version ──────────────────────────────────────────────────────────────────
@@ -424,6 +425,12 @@ struct CKBBuiltTx {
 
 // ─── CKBClient class ──────────────────────────────────────────────────────────
 
+// Forward declarations for signer types (full definition in CKBSigner.h, included at bottom)
+#if CKB_HAS_SIGNER
+class CKBKey;
+class CKBSigner;
+#endif
+
 class CKBClient {
 public:
     /**
@@ -785,5 +792,11 @@ inline bool CKBClient::isValidAddress(const char* address) {
     bool testnet = strncmp(address, "ckt1", 4) == 0;
     return mainnet || testnet;
 }
+
+// CKBSigner included here — AFTER all struct definitions so CKBBuiltTx is visible.
+// The guard in CKBSigner.h (#ifndef CKB_ESP32_H) prevents duplicate struct definitions.
+#if CKB_HAS_SIGNER
+  #include "CKBSigner.h"
+#endif
 
 #endif // CKB_ESP32_H

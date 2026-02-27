@@ -30,10 +30,10 @@ extern "C" {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void CKBSigner::bytesToHex(const uint8_t* bytes, size_t len, char* out) {
-    static const char HEX[] = "0123456789abcdef";
+    static const char HEX_CHARS[] = "0123456789abcdef";
     for (size_t i = 0; i < len; i++) {
-        out[i*2]     = HEX[bytes[i] >> 4];
-        out[i*2 + 1] = HEX[bytes[i] & 0x0F];
+        out[i*2]     = HEX_CHARS[bytes[i] >> 4];
+        out[i*2 + 1] = HEX_CHARS[bytes[i] & 0x0F];
     }
     out[len * 2] = '\0';
 }
@@ -211,6 +211,13 @@ bool CKBSigner::sign(const uint8_t hash[CKB_HASH_SIZE],
 }
 
 bool CKBSigner::signTx(CKBBuiltTx& tx, const CKBKey& key) {
+#ifdef CKB_ESP32_H
+    // CKBBuiltTx from CKB.h — fields: signingHash[32], signed_, signature[65]
+    if (!sign(tx.signingHash, key, tx.signature)) return false;
+    tx.signed_ = true;
+    return true;
+#else
+    // CKBBuiltTx from CKBSigner.h — fields: signingHashReady, signedOk, error[]
     if (!tx.signingHashReady) {
         strncpy(tx.error, "signingHash not set — call computeSigningHash first",
                 sizeof(tx.error) - 1);
@@ -222,6 +229,7 @@ bool CKBSigner::signTx(CKBBuiltTx& tx, const CKBKey& key) {
     }
     tx.signedOk = true;
     return true;
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,7 +240,7 @@ bool CKBKey::loadPrivateKey(const uint8_t privKey[CKB_PRIVKEY_SIZE]) {
     memcpy(_privKey, privKey, 32);
     // Validate by computing public key — ecdsa_get_public_key33 returns 0 on success
     uint8_t pub[33];
-    _valid = (ecdsa_get_public_key33(&secp256k1, _privKey, pub) == 0);
+    ecdsa_get_public_key33(&secp256k1, _privKey, pub); _valid = (pub[0] == 0x02 || pub[0] == 0x03);
     return _valid;
 }
 
@@ -247,7 +255,7 @@ bool CKBKey::loadPrivateKeyHex(const char* hexStr) {
 
 bool CKBKey::getPublicKey(uint8_t pubKeyOut[CKB_PUBKEY_SIZE]) const {
     if (!_valid) return false;
-    return (ecdsa_get_public_key33(&secp256k1, _privKey, pubKeyOut) == 0);
+    ecdsa_get_public_key33(&secp256k1, _privKey, pubKeyOut); return (pubKeyOut[0] == 0x02 || pubKeyOut[0] == 0x03);
 }
 
 bool CKBKey::getLockArgs(uint8_t lockArgsOut[CKB_LOCK_ARGS_SIZE]) const {

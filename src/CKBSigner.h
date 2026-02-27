@@ -47,6 +47,11 @@
 #define CKB_TX_MAX_OUTPUTS  8
 #define CKB_TX_MAX_CELLDEPS 4
 
+// CKBBuiltTx structs — only defined here if CKB.h hasn't included them already.
+// When CKB_WITH_SIGNER is set, CKB.h includes CKBSigner.h *after* defining its
+// own versions of these structs — guard prevents redefinition.
+#ifndef CKB_ESP32_H
+
 struct CKBTxCellDep {
     char txHash[67];    // "0x" + 64 hex
     uint32_t index;
@@ -92,6 +97,8 @@ struct CKBBuiltTx {
 };
 
 // ─── CKBKey — secp256k1 key pair ─────────────────────────────────────────────
+
+#endif // !CKB_ESP32_H — end of struct definitions guarded against CKB.h
 
 class CKBKey {
 public:
