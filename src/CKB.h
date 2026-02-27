@@ -610,6 +610,48 @@ public:
      * Collect live input cells sufficient to cover targetShannon.
      * Used internally by buildTransfer(); exposed for custom tx building.
      */
+
+    /**
+     * One-shot transfer: build → sign → broadcast in a single call.
+     *
+     * Equivalent to:
+     *   CKBBuiltTx tx = buildTransfer(fromAddr, toAddr, amountCKB);
+     *   CKBSigner::signTx(tx, key);
+     *   broadcast(tx, nodeUrl, txHashOut);
+     *
+     * @param fromAddr   Sender CKB address (must match key)
+     * @param toAddr     Recipient CKB address
+     * @param amountCKB  Amount in CKB (e.g. 100.0)
+     * @param key        Loaded CKBKey with sender's private key
+     * @param nodeUrl    Full node RPC URL (e.g. "http://192.168.1.1:8114")
+     * @param txHashOut  Output buffer for tx hash (67 bytes), or nullptr
+     * @return CKBError — CKB_OK on success
+     */
+    /**
+     * One-shot transfer: build → sign → broadcast in a single call.
+     *
+     * The sender address is derived automatically from the key — no need to
+     * pass it separately. Uses the node URL set in the constructor by default.
+     *
+     * Equivalent to:
+     *   char from[120]; key.getAddress(from, sizeof(from), !_testnet);
+     *   CKBBuiltTx tx = buildTransfer(from, toAddr, ckbToShannon(amountCKB));
+     *   signTx(tx, key);
+     *   broadcast(tx, _nodeUrl, txHashOut);
+     *
+     * @param toAddr     Recipient CKB address
+     * @param amountCKB  Amount in CKB (e.g. 100.0)
+     * @param key        Loaded CKBKey — from address derived automatically
+     * @param txHashOut  Output buffer for tx hash (67 bytes), or nullptr
+     * @param nodeUrl    Override node URL (defaults to constructor URL)
+     * @return CKBError — CKB_OK on success
+     */
+    CKBError sendTransaction(const char* toAddr,
+                              float amountCKB,
+                              const CKBKey& key,
+                              char* txHashOut = nullptr,
+                              const char* nodeUrl = nullptr);
+
     CKBError collectInputCells(const CKBScript& lockScript,
                                 uint64_t targetShannon,
                                 CKBTxInput outInputs[],

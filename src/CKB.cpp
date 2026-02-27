@@ -1205,6 +1205,37 @@ bool CKBClient::_rpcCallStatic(const char* url, const char* method,
     return true;
 }
 
+// ── sendTransaction ───────────────────────────────────────────────────────────
+
+CKBError CKBClient::sendTransaction(const char* toAddr,
+                                     float amountCKB,
+                                     const CKBKey& key,
+                                     char* txHashOut,
+                                     const char* nodeUrl) {
+    if (!key.isValid()) return CKB_ERR_INVALID;
+
+    // Use instance node URL if none supplied
+    const char* url = (nodeUrl && nodeUrl[0]) ? nodeUrl : _nodeUrl;
+    if (!url || !url[0]) return CKB_ERR_INVALID;
+
+    // Derive from-address from the key (mainnet unless _testnet flag set)
+    char fromAddr[120];
+    if (!key.getAddress(fromAddr, sizeof(fromAddr), !_testnet))
+        return CKB_ERR_INVALID;
+
+    // 1. Build (convert CKB float → shannon)
+    uint64_t amountShannon = ckbToShannon(amountCKB);
+    CKBBuiltTx tx = buildTransfer(fromAddr, toAddr, amountShannon);
+    if (!tx.valid) return tx.error;
+
+    // 2. Sign (via signTx wrapper — avoids ODR struct mismatch)
+    CKBError signErr = signTx(tx, key);
+    if (signErr != CKB_OK) return signErr;
+
+    // 3. Broadcast
+    return broadcast(tx, url, txHashOut);
+}
+
 // ── broadcast ────────────────────────────────────────────────────────────────
 
 CKBError CKBClient::broadcast(const CKBBuiltTx& tx, const char* nodeUrl,
@@ -1282,6 +1313,17 @@ CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeU
 
     JsonDocument doc;
     if (!_rpcCallStatic(nodeUrl, "send_transaction", params, doc, timeoutMs)) {
+        if (doc.containsKey("error")) {
+            const char* msg = doc["error"]["message"] | "unknown";
+            // Duplicate = already in pool or already committed → treat as success
+            if (strstr(msg, "PoolRejectedDuplicatedTransaction") ||
+                strstr(msg, "Duplicated")) {
+                // Extract tx hash from error message if txHashOut requested
+                // (we already have it from the tx itself — compute from raw_tx)
+                return CKB_OK;
+            }
+            if (_debug) Serial.printf("[CKB] send_transaction rejected: %s\n", msg);
+        }
         return CKB_ERR_RPC;
     }
 

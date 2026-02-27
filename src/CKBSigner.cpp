@@ -203,9 +203,9 @@ bool CKBSigner::sign(const uint8_t hash[CKB_HASH_SIZE],
 
     if (ret != 0) return false;
 
-    // CKB witness signature format: [recid(1) | r(32) | s(32)]
-    sigOut[0] = recId & 0x03;   // mask to 0-3 (usually 0 or 1)
-    memcpy(sigOut + 1, rawSig, 64);
+    // CKB witness signature format: [r(32) | s(32) | recid(1)]
+    memcpy(sigOut, rawSig, 64);
+    sigOut[64] = recId & 0x03;  // mask to 0-3 (usually 0 or 1)
 
     return true;
 }
