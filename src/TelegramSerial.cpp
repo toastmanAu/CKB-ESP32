@@ -23,7 +23,7 @@ TelegramSerial::TelegramSerial(const char* ssid,
       _mirror(mirror), _fmt(fmt),
       _lineLen(0),
       _qHead(0), _qTail(0), _qLen(0),
-      _lastSendMs(0)
+      _lastSendMs(0), _retries(0)
 {
     memset(_lineBuf, 0, sizeof(_lineBuf));
 }
@@ -87,10 +87,12 @@ bool TelegramSerial::send(const char* msg) {
 
 // ── update() — drain queue, one message per call ─────────────────────────────
 void TelegramSerial::update() {
-    // WiFi watchdog
+    // WiFi watchdog — attempt reconnect, but don't block if it fails
     if (WiFi.status() != WL_CONNECTED) {
         _wifiConnect();
-        return;
+        // If still not connected after attempt, leave queue intact and return.
+        // Messages will be sent on the next update() once WiFi comes back.
+        if (WiFi.status() != WL_CONNECTED) return;
     }
 
     if (_qLen == 0) return;
@@ -102,10 +104,21 @@ void TelegramSerial::update() {
     // Pop from queue head
     const char* msg = _queue[_qHead];
     bool ok = _sendNow(msg);
-    (void)ok;  // best-effort; drop on repeated failure handled inside _sendNow
 
-    _qHead = (_qHead + 1) % TG_QUEUE_SIZE;
-    _qLen--;
+    if (ok || _retries >= TG_MAX_MSG_RETRIES) {
+        // Success or exhausted retries — advance queue
+        _qHead = (_qHead + 1) % TG_QUEUE_SIZE;
+        _qLen--;
+        _retries = 0;
+    } else {
+        // Failed but retries remain — leave message in queue, increment counter
+        _retries++;
+        if (_mirror) {
+            _mirror->printf("[TelegramSerial] send failed, retry %d/%d\n",
+                            _retries, TG_MAX_MSG_RETRIES);
+        }
+    }
+
     _lastSendMs = millis();
 }
 
@@ -128,7 +141,12 @@ bool TelegramSerial::_enqueue(const char* msg) {
 
 // ── _sendNow() — blocking HTTPS POST to Telegram API ─────────────────────────
 bool TelegramSerial::_sendNow(const char* msg) {
-    if (!msg || !connected()) return false;
+    if (!msg) return false;
+
+    // Double-check WiFi right before the HTTP call.
+    // WiFi.status() is fast and avoids blocking in http.GET() if we just lost
+    // the connection between update()'s check and here.
+    if (WiFi.status() != WL_CONNECTED) return false;
 
     // Build message text
     char text[TG_LINE_BUF_SIZE + 64];
@@ -174,7 +192,7 @@ bool TelegramSerial::_sendNow(const char* msg) {
 
     HTTPClient http;
     http.begin(client, url);
-    http.setTimeout(8000);
+    http.setTimeout(4000);  // 4s — fail fast so update() doesn't block the loop
 
     int code = http.GET();
     bool ok  = (code == 200);

@@ -135,6 +135,7 @@ private:
 
     // Rate limiting
     unsigned long _lastSendMs;
+    uint8_t       _retries;   // consecutive failed sends on current head message
 
     // Internal helpers
     bool _enqueue(const char* msg);
