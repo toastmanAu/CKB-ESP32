@@ -12,15 +12,15 @@
   "frameworks": "arduino",
   "platforms": "espressif32",
   "dependencies": {
-    "bblanchon/ArduinoJson": "^7.0.0"
+    "bblanchon/ArduinoJson": "^7.0.0",
+    "toastmanAu/TelegramSerial": ">=1.0.0"
   },
   "examples": [
     "examples/BasicNodeInfo/BasicNodeInfo.ino",
     "examples/WatchAddress/WatchAddress.ino",
     "examples/IndexerCells/IndexerCells.ino",
     "examples/TransferCKB/TransferCKB.ino",
-    "examples/CKBSigningExample/CKBSigningExample.ino",
-    "examples/TelegramSerialDemo/TelegramSerialDemo.ino"
+    "examples/CKBSigningExample/CKBSigningExample.ino"
   ],
   "build": {
     "srcFilter": "+<src/*>"
