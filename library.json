@@ -1,9 +1,9 @@
 {
   "name": "CKB-ESP32",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "authors": "toastmanAu <phill@blackboxdata.xyz>",
-  "description": "Nervos CKB RPC client library for ESP32/Arduino. Wraps CKB Node RPC and Indexer RPC into clean C++ structs and functions. Covers chain queries, transaction lookup, live cells, Indexer cell/tx queries, address balance, payment watching, and address decoding — up to full indexer level.",
-  "keywords": "nervos, ckb, blockchain, rpc, web3, crypto, payments, indexer",
+  "description": "Nervos CKB blockchain client for ESP32. Full node and indexer RPC, on-device secp256k1 signing (RFC6979, no mbedTLS), bech32m address encode/decode/convert (all CKB formats), modular build profiles, TelegramSerial wireless output.",
+  "keywords": "nervos, ckb, blockchain, rpc, web3, crypto, signing, secp256k1, bech32m, payments",
   "repository": {
     "type": "git",
     "url": "https://github.com/toastmanAu/CKB-ESP32"
@@ -17,7 +17,10 @@
   "examples": [
     "examples/BasicNodeInfo/BasicNodeInfo.ino",
     "examples/WatchAddress/WatchAddress.ino",
-    "examples/IndexerCells/IndexerCells.ino"
+    "examples/IndexerCells/IndexerCells.ino",
+    "examples/TransferCKB/TransferCKB.ino",
+    "examples/CKBSigningExample/CKBSigningExample.ino",
+    "examples/TelegramSerialDemo/TelegramSerialDemo.ino"
   ],
   "build": {
     "srcFilter": "+<src/*>"
