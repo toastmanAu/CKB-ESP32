@@ -646,6 +646,39 @@ public:
      */
     static CKBScript decodeAddress(const char* address);
 
+    /**
+     * Encode a lock script back to a CKB full address (bech32m, CKB2021 format).
+     * hrp: "ckb" (mainnet) or "ckt" (testnet).
+     * out: caller-supplied buffer, needs ~100 bytes.
+     * Returns true on success.
+     */
+    static bool encodeAddress(const CKBScript& script, char* out, size_t outSize,
+                              const char* hrp = "ckb");
+
+    /**
+     * Convert between CKB address formats.
+     *
+     * inputAddr  — any valid CKB address (old short, old full, or CKB2021 full)
+     * out        — caller-supplied output buffer (~100 bytes)
+     * outSize    — size of out
+     * toFormat   — target format:
+     *                CKB_ADDR_FULL   (default) — CKB2021 bech32m full address
+     *                CKB_ADDR_SHORT  — deprecated short address (secp256k1 only)
+     * toMainnet  — true = ckb1..., false = ckt1... (testnet)
+     *
+     * Returns true on success, false if inputAddr is unparseable or the
+     * conversion is not applicable (e.g. CKB_ADDR_SHORT on a non-secp256k1 lock).
+     *
+     * Example:
+     *   char full[100];
+     *   CKBClient::convertAddress(shortAddr, full, sizeof(full));
+     *   // full now contains the CKB2021 full address
+     */
+    enum CKBAddrFormat { CKB_ADDR_FULL = 0, CKB_ADDR_SHORT = 1 };
+    static bool convertAddress(const char* inputAddr, char* out, size_t outSize,
+                               CKBAddrFormat toFormat = CKB_ADDR_FULL,
+                               bool toMainnet = true);
+
     // ── Utility (always available) ────────────────────────────────────────────
 
     /** Shannon to CKB float */
@@ -755,6 +788,8 @@ private:
     // Address decoder helpers
     static bool _bech32Decode(const char* addr, uint8_t* data, size_t& len, char* hrp);
     static uint8_t _bech32CharToVal(char c);
+    static bool _bech32mEncode(const char* hrp, const uint8_t* data, size_t dataLen,
+                               char* out, size_t outSize);
 
     void _debugPrint(const char* msg);
 };
@@ -770,7 +805,8 @@ inline uint64_t CKBClient::shannonToCKBInt(uint64_t shannon) {
 }
 
 inline uint64_t CKBClient::ckbToShannon(float ckb) {
-    return (uint64_t)(ckb * CKB_SHANNON_PER_CKB);
+    // Use double to avoid float32 precision loss at large CKB values (e.g. 1000 CKB)
+    return (uint64_t)((double)ckb * (double)CKB_SHANNON_PER_CKB + 0.5);
 }
 
 inline bool CKBClient::isValidTxHash(const char* hash) {

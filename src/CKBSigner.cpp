@@ -210,26 +210,18 @@ bool CKBSigner::sign(const uint8_t hash[CKB_HASH_SIZE],
     return true;
 }
 
+bool CKBSigner::signTxRaw(const uint8_t signingHashIn[CKB_HASH_SIZE],
+                           const CKBKey& key,
+                           uint8_t sigOut[CKB_SIG_SIZE],
+                           bool& signedOut) {
+    signedOut = false;
+    if (!sign(signingHashIn, key, sigOut)) return false;
+    signedOut = true;
+    return true;
+}
+
 bool CKBSigner::signTx(CKBBuiltTx& tx, const CKBKey& key) {
-#ifdef CKB_ESP32_H
-    // CKBBuiltTx from CKB.h — fields: signingHash[32], signed_, signature[65]
-    if (!sign(tx.signingHash, key, tx.signature)) return false;
-    tx.signed_ = true;
-    return true;
-#else
-    // CKBBuiltTx from CKBSigner.h — fields: signingHashReady, signedOk, error[]
-    if (!tx.signingHashReady) {
-        strncpy(tx.error, "signingHash not set — call computeSigningHash first",
-                sizeof(tx.error) - 1);
-        return false;
-    }
-    if (!sign(tx.signingHash, key, tx.signature)) {
-        strncpy(tx.error, "ECDSA sign failed", sizeof(tx.error) - 1);
-        return false;
-    }
-    tx.signedOk = true;
-    return true;
-#endif
+    return signTxRaw(tx.signingHash, key, tx.signature, tx.signed_);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,7 +230,11 @@ bool CKBSigner::signTx(CKBBuiltTx& tx, const CKBKey& key) {
 
 bool CKBKey::loadPrivateKey(const uint8_t privKey[CKB_PRIVKEY_SIZE]) {
     memcpy(_privKey, privKey, 32);
-    // Validate by computing public key — ecdsa_get_public_key33 returns 0 on success
+    // Reject all-zero key explicitly (invalid secp256k1 private key)
+    bool allZero = true;
+    for (int i = 0; i < 32; i++) if (_privKey[i] != 0) { allZero = false; break; }
+    if (allZero) { _valid = false; return false; }
+    // Validate by computing public key — checks key is on-curve and < group order
     uint8_t pub[33];
     ecdsa_get_public_key33(&secp256k1, _privKey, pub); _valid = (pub[0] == 0x02 || pub[0] == 0x03);
     return _valid;
@@ -360,15 +356,14 @@ bool CKBKey::getAddress(char* buf, size_t bufLen, bool mainnet) const {
     size_t  data5Len = 0;
     if (!_convertBits(payload, 54, 8, 5, true, data5, &data5Len)) return false;
 
-    // Build checksum input: hrp high bits + 0 + hrp low bits + 0 + data5
-    size_t enc_len = hrpLen + 1 + hrpLen + 1 + data5Len + 6;
+    // Build checksum input: hrp high bits + 0 + hrp low bits + data5 + 6 zeros
+    size_t enc_len = hrpLen + 1 + hrpLen + data5Len + 6;
     if (enc_len > 200) return false;
     uint8_t enc[200];
     size_t pos = 0;
     for (size_t i = 0; i < hrpLen; i++) enc[pos++] = (uint8_t)(hrp[i] >> 5);
     enc[pos++] = 0;
     for (size_t i = 0; i < hrpLen; i++) enc[pos++] = (uint8_t)(hrp[i] & 0x1F);
-    enc[pos++] = 0;
     memcpy(enc + pos, data5, data5Len); pos += data5Len;
     memset(enc + pos, 0, 6); pos += 6;
 

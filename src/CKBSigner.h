@@ -83,9 +83,8 @@ struct CKBBuiltTx {
 
     // Signing state
     uint8_t  signingHash[CKB_HASH_SIZE];  // set by CKBSigner::computeSigningHash()
-    bool     signingHashReady;
     uint8_t  signature[CKB_SIG_SIZE];     // set by CKBSigner::signTx()
-    bool     signedOk;
+    bool     signed_;                     // true after signTx() succeeds
 
     // Totals
     uint64_t totalInputCapacity;
@@ -171,6 +170,19 @@ public:
      * tx.signingHash must be set first (call computeSigningHash*).
      */
     static bool signTx(CKBBuiltTx& tx, const CKBKey& key);
+
+    /**
+     * Raw-pointer overload — struct-layout-independent.
+     * Use when the caller's CKBBuiltTx may have a different layout
+     * (e.g. the extended CKB.h version vs the standalone CKBSigner.h version).
+     * signingHashIn: 32-byte input hash
+     * sigOut:        65-byte output buffer for [recid|r|s]
+     * signedOut:     set to true on success
+     */
+    static bool signTxRaw(const uint8_t signingHashIn[CKB_HASH_SIZE],
+                          const CKBKey& key,
+                          uint8_t sigOut[CKB_SIG_SIZE],
+                          bool&   signedOut);
 
     // ── WitnessArgs molecule helpers ──────────────────────────────────────────
 

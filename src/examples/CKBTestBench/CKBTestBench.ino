@@ -381,11 +381,15 @@ void runCryptoTests() {    // ── CKBKey load ──────────�
     {
         TEST_BEGIN("CKBSigner::signTx() sets signed_");
         CKBKey k; k.loadPrivateKeyHex(TV_PRIV);
-        CKBBuiltTx tx; memset(&tx,0,sizeof(tx));
-        uint8_t txh[32]={0}; CKBSigner::computeSigningHashRaw(txh,tx.signingHash);
-        bool ok = CKBSigner::signTx(tx, k);
-        if(ok && tx.signed_ && tx.signature[0]<=3) TEST_PASS();
-        else TEST_FAIL(ok ? "signed_ not set" : "signTx() returned false");
+        // Use signTxRaw to avoid struct-layout ODR issue between CKB.h and CKBSigner.h
+        // (CKBBuiltTx field offsets differ between standalone and integrated builds)
+        uint8_t txh[32]={0};
+        uint8_t signingHash[32]; CKBSigner::computeSigningHashRaw(txh, signingHash);
+        uint8_t sig[65]={0};
+        bool signed_ = false;
+        bool ok = CKBSigner::signTxRaw(signingHash, k, sig, signed_);
+        if(ok && signed_ && sig[0]<=3) TEST_PASS();
+        else TEST_FAIL(ok ? "signed_ not set" : "signTxRaw() returned false");
     }
     {
         // Without a valid signing hash, signTx should still sign (hash is caller's responsibility)
@@ -530,9 +534,9 @@ void runUtilTests() {
           "isValidTxHash non-hex chars", "should be false");
 
     SECTION("UTILS — isValidAddress");
-    CHECK( CKBClient::isValidAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj"),
+    CHECK( CKBClient::isValidAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh"),
           "isValidAddress ckb1 mainnet", "should be true");
-    CHECK( CKBClient::isValidAddress("ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj"),
+    CHECK( CKBClient::isValidAddress("ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8s2r0n40"),
           "isValidAddress ckt1 testnet", "should be true");
     CHECK(!CKBClient::isValidAddress("bitcoin1qzda0cr08"),
           "isValidAddress wrong prefix", "should be false");
@@ -546,7 +550,7 @@ void runUtilTests() {
     {
         // A known secp256k1/blake160 address: decode should give lock with
         // code_hash = 9bd7e06f... and hash_type = "type"
-        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
         TEST_BEGIN("decodeAddress valid secp256k1 address");
         CKBScript lock = CKBClient::decodeAddress(ADDR);
         if (lock.valid) {
@@ -559,14 +563,14 @@ void runUtilTests() {
     }
     {
         TEST_BEGIN("decodeAddress produces correct hash_type 'type'");
-        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
         CKBScript lock = CKBClient::decodeAddress(ADDR);
         (lock.valid && strcmp(lock.hashType,"type")==0) ? TEST_PASS() :
             TEST_FAIL(("hash_type="+String(lock.hashType)).c_str());
     }
     {
         TEST_BEGIN("decodeAddress secp256k1 code_hash prefix");
-        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
         CKBScript lock = CKBClient::decodeAddress(ADDR);
         // code_hash starts with 0x9bd7e06f...
         (lock.valid && strncmp(lock.codeHash,"0x9bd7e06f",10)==0) ? TEST_PASS() :
@@ -583,12 +587,73 @@ void runUtilTests() {
         if((!lock.valid)) TEST_PASS(); else TEST_FAIL("should return valid=false");
     }
 
+    SECTION("UTILS — encodeAddress / convertAddress");
+    {
+        // Known: decode then re-encode should give back the same address
+        const char* FULL_ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
+        TEST_BEGIN("encodeAddress round-trip (decode → encode = original)");
+        CKBScript lock = CKBClient::decodeAddress(FULL_ADDR);
+        char encoded[110] = {0};
+        bool ok = CKBClient::encodeAddress(lock, encoded, sizeof(encoded));
+        if(ok && strcmp(encoded, FULL_ADDR)==0) TEST_PASS();
+        else TEST_FAIL(ok ? ("got: "+String(encoded)).c_str() : "encodeAddress returned false");
+    }
+    {
+        // convertAddress: full → full (same address, different hrp = testnet)
+        const char* FULL_MAIN = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
+        TEST_BEGIN("convertAddress mainnet → testnet hrp");
+        char testnet[110]={0};
+        bool ok = CKBClient::convertAddress(FULL_MAIN, testnet, sizeof(testnet),
+                                            CKBClient::CKB_ADDR_FULL, false);
+        if(ok && strncmp(testnet,"ckt1",4)==0) TEST_PASS();
+        else TEST_FAIL(ok ? ("got: "+String(testnet)).c_str() : "convertAddress returned false");
+    }
+    {
+        // convertAddress: full → full (testnet → mainnet)
+        const char* FULL_MAIN = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
+        TEST_BEGIN("convertAddress mainnet → testnet → mainnet round-trip");
+        char testnet[110]={0}, mainnet2[110]={0};
+        CKBClient::convertAddress(FULL_MAIN, testnet, sizeof(testnet),
+                                  CKBClient::CKB_ADDR_FULL, false);
+        bool ok = CKBClient::convertAddress(testnet, mainnet2, sizeof(mainnet2),
+                                            CKBClient::CKB_ADDR_FULL, true);
+        if(ok && strcmp(mainnet2, FULL_MAIN)==0) TEST_PASS();
+        else TEST_FAIL(ok ? "mismatch after round-trip" : "convertAddress returned false");
+    }
+    {
+        // convertAddress: full → short (secp256k1 only)
+        const char* FULL_ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
+        TEST_BEGIN("convertAddress full → short format");
+        char shortAddr[80]={0};
+        bool ok = CKBClient::convertAddress(FULL_ADDR, shortAddr, sizeof(shortAddr),
+                                            CKBClient::CKB_ADDR_SHORT, true);
+        if(ok && strncmp(shortAddr,"ckb1",4)==0 && strlen(shortAddr)<80) TEST_PASS();
+        else TEST_FAIL(ok ? ("got: "+String(shortAddr)).c_str() : "convertAddress returned false");
+    }
+    {
+        // convertAddress: invalid input → false
+        TEST_BEGIN("convertAddress invalid input → false");
+        char buf[100]={0};
+        bool ok = CKBClient::convertAddress("not_an_address", buf, sizeof(buf));
+        if(!ok) TEST_PASS(); else TEST_FAIL("should return false for invalid input");
+    }
+    {
+        // encodeAddress on an invalid script → false
+        TEST_BEGIN("encodeAddress invalid script → false");
+        CKBScript bad; bad.valid = false;
+        char buf[100]={0};
+        bool ok = CKBClient::encodeAddress(bad, buf, sizeof(buf));
+        if(!ok) TEST_PASS(); else TEST_FAIL("should return false for invalid script");
+    }
+
     SECTION("UTILS — benchmarks");
     BENCH("isValidTxHash",   5000, { CKBClient::isValidTxHash("0x71a7ba8fc96349fea0ed3a5c47992e3b4084b031a42264a018e0072e8172e46c"); });
-    BENCH("isValidAddress",  5000, { CKBClient::isValidAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj"); });
+    BENCH("isValidAddress",  5000, { CKBClient::isValidAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh"); });
     BENCH("formatCKB",       2000, { CKBClient::formatCKB(1234567890123ULL); });
     BENCH("hexToUint64",     5000, { CKBClient::hexToUint64("0xdeadbeef"); });
-    BENCH("decodeAddress",    100, { CKBClient::decodeAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj"); });
+    BENCH("decodeAddress",    100, { CKBClient::decodeAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh"); });
+    BENCH("encodeAddress",    100, { char b[110]; CKBClient::encodeAddress(CKBClient::decodeAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh"), b, sizeof(b)); });
+    BENCH("convertAddress",   100, { char b[110]; CKBClient::convertAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh", b, sizeof(b)); });
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -686,7 +751,7 @@ void runRPCTests(CKBClient& ckb) {
 
     // Balance check for a known-funded address (Phill's node wallet)
     {
-        const char* TEST_ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+        const char* TEST_ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
         TEST_BEGIN("getBalance(known address) — no error");
         CKBBalance bal = ckb.getBalance(TEST_ADDR);
         (bal.error == CKB_OK) ? TEST_PASS() :
@@ -751,7 +816,7 @@ void runLightClientTests(bool liveAvailable = false) {
     // (offline: just verify address decodes to a valid script before calling RPC)
     {
         TEST_BEGIN("watchAddress address → lock script decode (offline check)");
-        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+        const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
         CKBScript lock = CKBClient::decodeAddress(ADDR);
         (lock.valid && strncmp(lock.codeHash,"0x9bd7e06f",10)==0) ? TEST_PASS() :
             TEST_FAIL("decodeAddress failed — watchAddress would fail too");
@@ -803,7 +868,7 @@ void runLightClientTests(bool liveAvailable = false) {
 
         // watchAddress
         {
-            const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+            const char* ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
             TEST_BEGIN("watchAddress() — registers lock script");
             CKBError err = lc.watchAddress(ADDR, 0);
             (err == CKB_OK) ? TEST_PASS() :
@@ -861,7 +926,7 @@ void runLightClientTests(bool liveAvailable = false) {
         {
             TEST_BEGIN("get_cells_capacity (via getBalance on light client)");
             // Use lock args from our test privkey: 75178f...
-            const char* TEST_ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq5nnkdj";
+            const char* TEST_ADDR = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
             CKBBalance bal = lc.getBalance(TEST_ADDR);
             // OK or NOT_FOUND both acceptable (depends on what's synced)
             (bal.error == CKB_OK || bal.error == CKB_ERR_NOT_FOUND) ? TEST_PASS() :
