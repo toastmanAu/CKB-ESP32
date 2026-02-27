@@ -535,28 +535,62 @@ bool CKBClient::_bech32Decode(const char* addr, uint8_t* data, size_t& len, char
     return true;
 }
 
+// Known code-hash table for deprecated short-address index lookup (RFC 0021)
+// index → { code_hash_hex, hash_type_byte }
+struct _CKBShortAddrEntry {
+    uint8_t     codeHash[32];
+    const char* hashType;   // "type" or "data"
+};
+static const _CKBShortAddrEntry _CKB_SHORT_ADDR_TABLE[] = {
+    // 0x00 — secp256k1-blake160-sighash-all (type)
+    {{ 0x9b,0xd7,0xe0,0x6f, 0x3e,0xcf,0x4b,0xe0, 0xf2,0xfc,0xd2,0x18,
+       0x8b,0x23,0xf1,0xb9, 0xfc,0xc8,0x8e,0x5d, 0x4b,0x65,0xa8,0x63,
+       0x7b,0x17,0x72,0x3b, 0xbd,0xa3,0xcc,0xe8 }, "type" },
+    // 0x01 — secp256k1-blake160-multisig-all (type)
+    {{ 0x5c,0x50,0x69,0xeb, 0x08,0x57,0xef,0xc6, 0x55,0xbe,0x74,0x9c,
+       0x6c,0x74,0xb2,0x33, 0x22,0xd1,0xc6,0x77, 0xa2,0x13,0x58,0x93,
+       0x64,0x62,0x30,0xac, 0x7f,0xd2,0xc2,0xb7 }, "type" },
+    // 0x02 — anyone-can-pay (type)
+    {{ 0xd3,0x69,0x59,0x7f, 0xf4,0x7f,0x29,0xfb, 0xb0,0xd1,0xf6,0x5a,
+       0x1f,0x54,0x82,0xa8, 0xb0,0x26,0x53,0x16, 0x8e,0x8e,0x83,0xed,
+       0x7f,0x0b,0x6c,0x1e, 0x7e,0x83,0xc5,0x0c }, "type" },
+};
+static const size_t _CKB_SHORT_ADDR_TABLE_LEN =
+    sizeof(_CKB_SHORT_ADDR_TABLE) / sizeof(_CKB_SHORT_ADDR_TABLE[0]);
+
 CKBScript CKBClient::decodeAddress(const char* address) {
     CKBScript out; out.valid = false;
     if (!address || strlen(address) < 46) return out;
 
-    uint8_t data[100]; size_t len = 0; char hrp[8];
+    uint8_t data[120]; size_t len = 0; char hrp[8];
     if (!_bech32Decode(address, data, len, hrp)) return out;
     if (len < 1) return out;
 
-    uint8_t formatByte = data[0];
+    uint8_t fmt = data[0];
 
-    if (formatByte == 0x01 && len == 22) {
-        // Short secp256k1 address: 0x01 + 20-byte args
-        strlcpy(out.codeHash, SECP256K1_CODE_HASH, sizeof(out.codeHash));
-        strlcpy(out.hashType, "type", sizeof(out.hashType));
-        // Convert 20 bytes to hex
+    if (fmt == 0x01 && len >= 2) {
+        // ── Deprecated short address ──────────────────────────────────────────
+        // payload: 0x01 | code_hash_index(1) | args(variable, usually 20)
+        uint8_t idx = data[1];
+        if (idx >= _CKB_SHORT_ADDR_TABLE_LEN) return out;  // unknown index
+        const _CKBShortAddrEntry& e = _CKB_SHORT_ADDR_TABLE[idx];
+        // code_hash
+        strcpy(out.codeHash, "0x");
+        for (int i = 0; i < 32; i++)
+            snprintf(out.codeHash + 2 + i*2, 3, "%02x", e.codeHash[i]);
+        strlcpy(out.hashType, e.hashType, sizeof(out.hashType));
+        // args (remaining bytes after index)
+        size_t argsBytes = len - 2;
         strcpy(out.args, "0x");
-        for (int i = 1; i <= 20; i++)
-            snprintf(out.args + 2 + (i-1)*2, 3, "%02x", data[i]);
+        for (size_t i = 0; i < argsBytes && i < 64; i++)
+            snprintf(out.args + 2 + i*2, 3, "%02x", data[2 + i]);
         out.valid = true;
 
-    } else if (formatByte == 0x00 && len >= 34) {
-        // Full address: 0x00 + codeHash(32) + hashType(1) + args
+    } else if (fmt == 0x00 && len >= 34) {
+        // ── Full address (deprecated bech32 OR current bech32m) ───────────────
+        // payload: 0x00 | code_hash(32) | hash_type(1) | args(variable)
+        // Both old full and CKB2021 full have identical payload; checksum differs
+        // but our decoder doesn't verify the checksum, so both work transparently.
         strcpy(out.codeHash, "0x");
         for (int i = 1; i <= 32; i++)
             snprintf(out.codeHash + 2 + (i-1)*2, 3, "%02x", data[i]);
@@ -565,16 +599,24 @@ CKBScript CKBClient::decodeAddress(const char* address) {
         else if (ht == 0x01) strlcpy(out.hashType, "type",  sizeof(out.hashType));
         else if (ht == 0x02) strlcpy(out.hashType, "data1", sizeof(out.hashType));
         else if (ht == 0x04) strlcpy(out.hashType, "data2", sizeof(out.hashType));
-        else strlcpy(out.hashType, "type", sizeof(out.hashType));
-
+        else                 strlcpy(out.hashType, "type",  sizeof(out.hashType));
         size_t argsBytes = len - 34;
-        if (argsBytes == 0) {
-            strlcpy(out.args, "0x", sizeof(out.args));
-        } else {
-            strcpy(out.args, "0x");
-            for (size_t i = 0; i < argsBytes && i < 64; i++)
-                snprintf(out.args + 2 + i*2, 3, "%02x", data[34 + i]);
-        }
+        strcpy(out.args, "0x");
+        for (size_t i = 0; i < argsBytes && i < 64; i++)
+            snprintf(out.args + 2 + i*2, 3, "%02x", data[34 + i]);
+        out.valid = true;
+
+    } else if (fmt == 0x02 && len >= 33) {
+        // ── Deprecated full with inline type script (very old format) ─────────
+        // payload: 0x02 | code_hash(32) | args(variable)  — hash_type implicitly "data"
+        strcpy(out.codeHash, "0x");
+        for (int i = 1; i <= 32; i++)
+            snprintf(out.codeHash + 2 + (i-1)*2, 3, "%02x", data[i]);
+        strlcpy(out.hashType, "data", sizeof(out.hashType));
+        size_t argsBytes = len - 33;
+        strcpy(out.args, "0x");
+        for (size_t i = 0; i < argsBytes && i < 64; i++)
+            snprintf(out.args + 2 + i*2, 3, "%02x", data[33 + i]);
         out.valid = true;
     }
     return out;
@@ -714,33 +756,65 @@ bool CKBClient::convertAddress(const char* inputAddr, char* out, size_t outSize,
         return encodeAddress(script, out, outSize, hrp);
 
     } else {
-        // Deprecated short address — only valid for secp256k1/blake160 type lock
-        // with exactly 20-byte args
-        const char* secp = "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8";
-        if (strcmp(script.codeHash, secp) != 0) return false;
-        if (strcmp(script.hashType, "type") != 0) return false;
-        const char* argsHex = script.args;
-        if (argsHex[0]=='0' && (argsHex[1]=='x'||argsHex[1]=='X')) argsHex += 2;
-        if (strlen(argsHex) != 40) return false;  // must be exactly 20 bytes
+        // Deprecated short address — only valid for scripts in the known index table
+        // (secp256k1-sighash, secp256k1-multisig, anyone-can-pay) with "type" hash_type
 
-        // Short payload: 0x01 | 0x00 (secp256k1 index) | args(20)
-        uint8_t payload[22];
-        payload[0] = 0x01; payload[1] = 0x00;
-        for (int i = 0; i < 20; i++) {
-            auto h = [](char c) -> int {
-                if (c>='0'&&c<='9') return c-'0';
-                if (c>='a'&&c<='f') return c-'a'+10;
-                if (c>='A'&&c<='F') return c-'A'+10;
+        // Parse the script's code_hash to raw bytes for table lookup
+        const char* chHex = script.codeHash;
+        if (chHex[0]=='0' && (chHex[1]=='x'||chHex[1]=='X')) chHex += 2;
+        if (strlen(chHex) != 64) return false;
+        uint8_t codeHashBytes[32];
+        for (int i = 0; i < 32; i++) {
+            auto h = [](char c)->int{
+                if(c>='0'&&c<='9')return c-'0';
+                if(c>='a'&&c<='f')return c-'a'+10;
+                if(c>='A'&&c<='F')return c-'A'+10;
                 return -1;
             };
-            int hi = h(argsHex[i*2]), lo = h(argsHex[i*2+1]);
-            if (hi<0||lo<0) return false;
-            payload[2+i] = (uint8_t)((hi<<4)|lo);
+            int hi=h(chHex[i*2]),lo=h(chHex[i*2+1]);
+            if(hi<0||lo<0)return false;
+            codeHashBytes[i]=(uint8_t)((hi<<4)|lo);
         }
-        // Short addresses use legacy bech32 (not bech32m) — but for simplicity
-        // we encode with bech32m here; most tools accept both.
-        // The CKB2021 full format is strongly preferred.
-        return _bech32mEncode(hrp, payload, 22, out, outSize);
+
+        // Find matching index in the known table
+        int8_t foundIdx = -1;
+        for (size_t i = 0; i < _CKB_SHORT_ADDR_TABLE_LEN; i++) {
+            if (memcmp(codeHashBytes, _CKB_SHORT_ADDR_TABLE[i].codeHash, 32) == 0
+                && strcmp(script.hashType, _CKB_SHORT_ADDR_TABLE[i].hashType) == 0) {
+                foundIdx = (int8_t)i;
+                break;
+            }
+        }
+        if (foundIdx < 0) return false;  // not a known short-address script
+
+        // Parse args
+        const char* argsHex = script.args;
+        if (argsHex[0]=='0' && (argsHex[1]=='x'||argsHex[1]=='X')) argsHex += 2;
+        size_t argsHexLen = strlen(argsHex);
+        if (argsHexLen & 1) return false;
+        size_t argsLen = argsHexLen / 2;
+        if (argsLen > 64) return false;
+
+        // Short payload: 0x01 | index | args(N)
+        uint8_t payload[67];
+        payload[0] = 0x01;
+        payload[1] = (uint8_t)foundIdx;
+        for (size_t i = 0; i < argsLen; i++) {
+            auto h = [](char c)->int{
+                if(c>='0'&&c<='9')return c-'0';
+                if(c>='a'&&c<='f')return c-'a'+10;
+                if(c>='A'&&c<='F')return c-'A'+10;
+                return -1;
+            };
+            int hi=h(argsHex[i*2]),lo=h(argsHex[i*2+1]);
+            if(hi<0||lo<0)return false;
+            payload[2+i]=(uint8_t)((hi<<4)|lo);
+        }
+
+        // Note: deprecated short addresses historically used bech32 (not bech32m).
+        // We encode with bech32m for simplicity; the payload format is the key signal.
+        // The CKB2021 full format is strongly preferred over short format.
+        return _bech32mEncode(hrp, payload, 2 + argsLen, out, outSize);
     }
 }
 

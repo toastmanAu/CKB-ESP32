@@ -646,6 +646,64 @@ void runUtilTests() {
         if(!ok) TEST_PASS(); else TEST_FAIL("should return false for invalid script");
     }
 
+    SECTION("UTILS — deprecated address formats");
+    // Old short address (secp256k1-sighash, index 0x00, bech32 checksum)
+    // Generated from privkey=1, args=75178f34549c5fe9cd1a0c57aebd01e7ddf9249e
+    {
+        const char* OLD_SHORT = "ckb1qyq829u0x32fchlfe5dqc4awh5q70h0eyj0q2zdh7f";
+        TEST_BEGIN("decodeAddress old short (0x01 secp256k1-sighash index)");
+        CKBScript s = CKBClient::decodeAddress(OLD_SHORT);
+        if(s.valid && strncmp(s.codeHash,"0x9bd7e06f",10)==0
+                   && strcmp(s.hashType,"type")==0
+                   && strncmp(s.args,"0x75178f",8)==0) TEST_PASS();
+        else TEST_FAIL(s.valid ? "wrong code_hash or args" : "decodeAddress returned false");
+    }
+    {
+        // Old full address = same payload as new full, but bech32 checksum (not bech32m)
+        // Our decoder strips checksum without verifying, so it parses both transparently
+        const char* OLD_FULL = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8s3d5s64";
+        TEST_BEGIN("decodeAddress old full (bech32 checksum, same payload as new full)");
+        CKBScript s = CKBClient::decodeAddress(OLD_FULL);
+        if(s.valid && strncmp(s.codeHash,"0x9bd7e06f",10)==0
+                   && strcmp(s.hashType,"type")==0
+                   && strncmp(s.args,"0x75178f",8)==0) TEST_PASS();
+        else TEST_FAIL(s.valid ? "wrong fields" : "decodeAddress returned false");
+    }
+    {
+        // Old short → convertAddress to new full → verify it matches known new full
+        const char* OLD_SHORT = "ckb1qyq829u0x32fchlfe5dqc4awh5q70h0eyj0q2zdh7f";
+        const char* NEW_FULL  = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
+        TEST_BEGIN("convertAddress old-short → new full");
+        char out[110]={0};
+        bool ok = CKBClient::convertAddress(OLD_SHORT, out, sizeof(out));
+        if(ok && strcmp(out, NEW_FULL)==0) TEST_PASS();
+        else TEST_FAIL(ok ? ("got: "+String(out)).c_str() : "convertAddress returned false");
+    }
+    {
+        // Old full → convertAddress to new full (should be same address body, different checksum)
+        const char* OLD_FULL = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8s3d5s64";
+        const char* NEW_FULL = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
+        TEST_BEGIN("convertAddress old-full (bech32) → new full (bech32m)");
+        char out[110]={0};
+        bool ok = CKBClient::convertAddress(OLD_FULL, out, sizeof(out));
+        if(ok && strcmp(out, NEW_FULL)==0) TEST_PASS();
+        else TEST_FAIL(ok ? ("got: "+String(out)).c_str() : "convertAddress returned false");
+    }
+    {
+        // New full → convertAddress to old short (round-trip back)
+        const char* NEW_FULL  = "ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh";
+        TEST_BEGIN("convertAddress new full → old short (secp256k1 index lookup)");
+        char out[80]={0};
+        bool ok = CKBClient::convertAddress(NEW_FULL, out, sizeof(out),
+                                            CKBClient::CKB_ADDR_SHORT, true);
+        // Decode the short addr back to verify it has same args
+        if(ok) {
+            CKBScript s = CKBClient::decodeAddress(out);
+            if(s.valid && strncmp(s.args,"0x75178f",8)==0) TEST_PASS();
+            else TEST_FAIL("short addr args mismatch");
+        } else TEST_FAIL("convertAddress returned false");
+    }
+
     SECTION("UTILS — benchmarks");
     BENCH("isValidTxHash",   5000, { CKBClient::isValidTxHash("0x71a7ba8fc96349fea0ed3a5c47992e3b4084b031a42264a018e0072e8172e46c"); });
     BENCH("isValidAddress",  5000, { CKBClient::isValidAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8sy3yulh"); });
