@@ -1,98 +1,116 @@
-/**
+/*
  * TransferCKB.ino — Build, sign, and broadcast a CKB transfer
  *
- * The transaction object is independent of where it's built or sent.
- * Build from one node, broadcast to any other.
+ * Two patterns shown:
+ *   A) Manual:   buildTransfer() + signTx() + broadcast() — full visibility
+ *   B) One-shot: sendTransaction()               — minimal code
  *
- * Node type selection (pick one, or omit for default = full):
+ * !! NEVER hard-code a real private key in firmware you share or commit !!
+ *    Use Preferences/NVS. See the Key Security section in the README.
  */
-// #define CKB_NODE_LIGHT       // Light client
-// #define CKB_NODE_INDEXER     // Separate indexer process
-// #define CKB_NODE_RICH        // Rich indexer (Mercury)
 
+#define CKB_PROFILE_SIGNER
 #include <WiFi.h>
 #include "CKB.h"
+#include "CKBSigner.h"
 
-const char* WIFI_SSID  = "your-wifi";
-const char* WIFI_PASS  = "your-password";
+// ── Config ────────────────────────────────────────────────────────────────────
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* CKB_NODE  = "http://192.168.1.100:8114";
 
-// Node used for building the tx (cell collection, indexer queries)
-// For CKB_NODE_FULL / CKB_NODE_LIGHT: just one URL
-CKBClient ckb("http://192.168.68.87:8114");
+// Load from NVS in production — see README Key Security section
+const char* PRIVKEY_HEX = "your-64-char-private-key-hex";
+const char* TO_ADDR     = "ckb1q...recipient";
+const float SEND_CKB    = 100.0f;
 
-// For separate indexer:
-// CKBClient ckb("http://192.168.68.87:8114", "http://192.168.68.87:8116");
+CKBClient ckb(CKB_NODE);
 
-// Broadcast target — can be any CKB node, does not need to match above
-const char* BROADCAST_NODE = "http://192.168.68.87:8114";
+// Run in 32KB FreeRTOS task — buildTransfer + crypto exceed default 8KB stack
+void transferTask(void*) {
+    // ── WiFi ──────────────────────────────────────────────────────────────────
+    Serial.printf("Connecting to %s", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis()-t0 < 15000)
+        { delay(300); Serial.print("."); }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi failed"); vTaskDelete(nullptr); return;
+    }
+    Serial.printf("\nConnected: %s\n\n", WiFi.localIP().toString().c_str());
 
-const char*    FROM_ADDR = "ckb1qyqyouraddresshere";
-const char*    TO_ADDR   = "ckb1qyqrecipientaddresshere";
-const uint64_t AMOUNT    = 100ULL * 100000000ULL;  // 100 CKB
-const uint64_t FEE       = 1000ULL;                // 1000 shannon
+    // ── Load key ──────────────────────────────────────────────────────────────
+    CKBKey key;
+    if (!key.loadPrivateKeyHex(PRIVKEY_HEX)) {
+        Serial.println("ERROR: invalid private key"); vTaskDelete(nullptr); return;
+    }
+
+    // Derive from address from the key — no need to hardcode it
+    char fromAddr[120];
+    key.getAddress(fromAddr, sizeof(fromAddr), true);   // true = mainnet
+    Serial.printf("From:    %s\n", fromAddr);
+    Serial.printf("To:      %s\n", TO_ADDR);
+    Serial.printf("Amount:  %.2f CKB\n\n", SEND_CKB);
+
+    // ── Check balance ─────────────────────────────────────────────────────────
+    CKBBalance bal = ckb.getBalance(fromAddr);
+    if (bal.error != CKB_OK || bal.shannon == 0) {
+        Serial.printf("Balance error or zero: %s\n", ckb.lastErrorStr());
+        vTaskDelete(nullptr); return;
+    }
+    Serial.printf("Balance: %s (%u cells)\n\n",
+        CKBClient::formatCKB(bal.shannon).c_str(), bal.cellCount);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Pattern A — Manual: full visibility over each step
+    // ══════════════════════════════════════════════════════════════════════════
+    Serial.println("── Pattern A: buildTransfer + signTx + broadcast ──");
+
+    CKBBuiltTx tx = ckb.buildTransfer(fromAddr, TO_ADDR, CKBClient::ckbToShannon(SEND_CKB));
+    if (!tx.valid) {
+        Serial.printf("Build failed: %s\n", ckb.lastErrorStr());
+        vTaskDelete(nullptr); return;
+    }
+
+    Serial.printf("TX hash:   %s\n", tx.txHashHex);
+    Serial.printf("Inputs:    %d cells, total %s\n",
+        tx.inputCount, CKBClient::formatCKB(tx.totalInputCapacity()).c_str());
+    Serial.printf("Send:      %s\n", CKBClient::formatCKB(tx.outputs[0].capacity).c_str());
+    if (tx.outputCount > 1)
+        Serial.printf("Change:    %s\n", CKBClient::formatCKB(tx.outputs[1].capacity).c_str());
+    Serial.printf("Fee:       %llu shannon\n\n", (unsigned long long)tx.fee());
+
+    if (ckb.signTx(tx, key) != CKB_OK || !tx.signed_) {
+        Serial.println("Sign failed"); vTaskDelete(nullptr); return;
+    }
+    Serial.println("Signed ✓");
+
+    char txHashA[67] = {0};
+    CKBError errA = CKBClient::broadcast(tx, CKB_NODE, txHashA);
+    if (errA == CKB_OK)
+        Serial.printf("Broadcast OK: %s\n\n", txHashA[0] ? txHashA : "(already in pool)");
+    else
+        Serial.printf("Broadcast failed (%d): %s\n\n", (int)errA, ckb.lastErrorStr());
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Pattern B — One-shot: minimal code, same result
+    // (Comment out Pattern A above before using this — needs a fresh funded cell)
+    // ══════════════════════════════════════════════════════════════════════════
+    // char txHashB[67] = {0};
+    // CKBError errB = ckb.sendTransaction(TO_ADDR, SEND_CKB, key, txHashB);
+    // if (errB == CKB_OK)
+    //     Serial.printf("Sent! TX: %s\n", txHashB[0] ? txHashB : "(already in pool)");
+    // else
+    //     Serial.printf("sendTransaction failed (%d): %s\n", (int)errB, ckb.lastErrorStr());
+
+    // ── Wipe key material ─────────────────────────────────────────────────────
+    key.clear();
+    vTaskDelete(nullptr);
+}
 
 void setup() {
     Serial.begin(115200);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-    Serial.println("\nWiFi connected — node type: " + String(CKBClient::nodeTypeStr()));
-
-    // ── 1. Check balance ──────────────────────────────────────────────────────
-    CKBBalance bal = ckb.getBalance(FROM_ADDR);
-    if (bal.valid) {
-        Serial.printf("Balance: %s\n", CKBClient::formatCKB(bal.totalCapacity).c_str());
-    }
-
-    // ── 2. Build the transaction ──────────────────────────────────────────────
-    Serial.println("Building transfer...");
-    CKBBuiltTx tx = ckb.buildTransfer(FROM_ADDR, TO_ADDR, AMOUNT, FEE);
-
-    if (!tx.valid) {
-        Serial.printf("Build failed: %s\n", CKBClient::lastErrorStr());
-        return;
-    }
-
-    // Inspect the transaction object
-    Serial.printf("TX hash:    %s\n",   tx.txHashHex);
-    Serial.printf("Inputs:     %d cells, total %s\n",
-        tx.inputCount,
-        CKBClient::formatCKB(tx.totalInputCapacity()).c_str());
-    Serial.printf("Send:       %s\n", CKBClient::formatCKB(tx.outputs[0].capacity).c_str());
-    if (tx.outputCount > 1)
-        Serial.printf("Change:     %s\n", CKBClient::formatCKB(tx.outputs[1].capacity).c_str());
-    Serial.printf("Fee:        %llu shannon\n", tx.fee());
-
-    // The signing hash — pass this to your signing function
-    Serial.print("Sign this:  ");
-    for (int i = 0; i < 32; i++) Serial.printf("%02x", tx.signingHash[i]);
-    Serial.println();
-
-    // ── 3. Sign ───────────────────────────────────────────────────────────────
-    // Sign tx.signingHash[32] with your secp256k1 private key.
-    // Implementations:
-    //   - Hardware wallet (ESP32-P4 + SPHINCS+): send over UART/SPI, get sig back
-    //   - mbedTLS on-device secp256k1: see mbedtls/ecp.h + mbedtls/ecdsa.h
-    //   - External signer: QR code → phone → scan back
-    //
-    // For testing (don't use for real funds):
-    uint8_t mySig[65] = {0};  // replace with real signature
-
-    tx.setSignature(mySig);
-
-    // ── 4. Broadcast ──────────────────────────────────────────────────────────
-    // Broadcast to ANY node — independent of which node built the tx
-    char submittedHash[67] = {0};
-    CKBError err = CKBClient::broadcast(tx, BROADCAST_NODE, submittedHash);
-
-    if (err == CKB_OK) {
-        Serial.printf("Broadcast OK: %s\n", submittedHash);
-    } else {
-        Serial.printf("Broadcast failed: %d\n", err);
-    }
-
-    // ── Advanced: broadcast with custom witness (e.g. SPHINCS+) ──────────────
-    // const char* sphincsWitness = "0x<hex-encoded WitnessArgs with SPHINCS+ sig>";
-    // CKBClient::broadcastWithWitness(tx, BROADCAST_NODE, sphincsWitness, submittedHash);
+    delay(1000);
+    xTaskCreatePinnedToCore(transferTask, "ckb", 32768, nullptr, 1, nullptr, 1);
 }
-
-void loop() {}
+void loop() { delay(10000); }

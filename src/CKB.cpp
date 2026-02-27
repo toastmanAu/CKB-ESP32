@@ -1322,7 +1322,7 @@ CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeU
                 // (we already have it from the tx itself — compute from raw_tx)
                 return CKB_OK;
             }
-            if (_debug) Serial.printf("[CKB] send_transaction rejected: %s\n", msg);
+            Serial.printf("[CKB] send_transaction rejected: %s\n", msg);
         }
         return CKB_ERR_RPC;
     }

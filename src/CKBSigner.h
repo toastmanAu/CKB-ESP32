@@ -158,7 +158,7 @@ public:
 
     /**
      * Sign a 32-byte hash with a CKBKey.
-     * Produces 65-byte CKB witness signature: [recid | r | s]
+     * Produces 65-byte CKB witness signature: [r(32) | s(32) | recid(1)]
      * Uses RFC6979 deterministic nonce (no TRNG dependency for k).
      */
     static bool sign(const uint8_t hash[CKB_HASH_SIZE],

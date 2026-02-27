@@ -3,26 +3,24 @@
  * CKB-ESP32 example — connect to a CKB node, display tip block, peers, epoch.
  *
  * Hardware: any ESP32 board with WiFi
- * Libraries: CKB-ESP32, ArduinoJson, WiFi
+ * Libraries: CKB-ESP32, ArduinoJson
+ * Profile: DISPLAY (no signing, no send)
  */
 
+#define CKB_PROFILE_DISPLAY
 #include <WiFi.h>
 #include "CKB.h"
 
-const char* SSID     = "YOUR_WIFI_SSID";
-const char* PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* SSID      = "YOUR_WIFI_SSID";
+const char* PASSWORD  = "YOUR_WIFI_PASSWORD";
+const char* CKB_NODE  = "http://192.168.1.100:8114";
 
-// Point at your local node, or a public RPC endpoint
-const char* CKB_NODE    = "http://192.168.1.100:8114";
-const char* CKB_INDEXER = "http://192.168.1.100:8116"; // built-in indexer
-
-CKBClient ckb(CKB_NODE, CKB_INDEXER);
+CKBClient ckb(CKB_NODE);
 
 void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Connect WiFi
     Serial.printf("Connecting to %s...\n", SSID);
     WiFi.begin(SSID, PASSWORD);
     while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
@@ -51,10 +49,12 @@ void setup() {
             (unsigned long long)epoch.number,
             (unsigned long long)epoch.startNumber,
             (unsigned long long)epoch.length);
-        Serial.printf("Progress:   block %llu / %llu (%.1f%%)\n",
-            (unsigned long long)(tip - epoch.startNumber),
-            (unsigned long long)epoch.length,
-            100.0 * (tip - epoch.startNumber) / epoch.length);
+        if (tip != UINT64_MAX && tip >= epoch.startNumber) {
+            Serial.printf("Progress:   block %llu / %llu (%.1f%%)\n",
+                (unsigned long long)(tip - epoch.startNumber),
+                (unsigned long long)epoch.length,
+                100.0 * (tip - epoch.startNumber) / epoch.length);
+        }
     }
 
     // ── Tx pool ───────────────────────────────────────────────────────────────
@@ -71,22 +71,24 @@ void setup() {
     Serial.printf("Peers:      %u connected\n", peerCount);
     for (uint8_t i = 0; i < peerCount && i < 3; i++) {
         Serial.printf("  [%u] %s (%s)\n", i,
-            peers[i].nodeId + 2,          // skip "Qm" prefix for brevity
+            peers[i].nodeId,
             peers[i].direction ? "out" : "in");
     }
 
     // ── Latest block ──────────────────────────────────────────────────────────
-    CKBBlock block = ckb.getBlockByNumber(tip);
-    if (block.valid) {
-        time_t t = CKBClient::msToTime(block.header.timestamp);
-        struct tm* tm_info = gmtime(&t);
-        char timeBuf[32];
-        strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S UTC", tm_info);
-        Serial.printf("\nLatest block %llu:\n", (unsigned long long)tip);
-        Serial.printf("  Time:      %s\n", timeBuf);
-        Serial.printf("  Txs:       %u\n", block.txCount);
-        Serial.printf("  Miner:     0x%s\n", block.minerLockArgs);
-        Serial.printf("  Hash:      %s\n", block.header.hash);
+    if (tip != UINT64_MAX) {
+        CKBBlock block = ckb.getBlockByNumber(tip);
+        if (block.valid) {
+            time_t t = CKBClient::msToTime(block.header.timestamp);
+            struct tm* tm_info = gmtime(&t);
+            char timeBuf[32];
+            strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S UTC", tm_info);
+            Serial.printf("\nLatest block %llu:\n", (unsigned long long)tip);
+            Serial.printf("  Time:   %s\n", timeBuf);
+            Serial.printf("  Txs:    %u\n", block.txCount);
+            Serial.printf("  Miner:  0x%s\n", block.minerLockArgs);
+            Serial.printf("  Hash:   %s\n", block.header.hash);
+        }
     }
 
     // ── Indexer tip ───────────────────────────────────────────────────────────
@@ -94,14 +96,15 @@ void setup() {
     if (idxTip.valid) {
         Serial.printf("\nIndexer at: block %llu\n",
             (unsigned long long)idxTip.blockNumber);
-        int64_t lag = (int64_t)tip - (int64_t)idxTip.blockNumber;
-        if (lag > 0) Serial.printf("Indexer lag: %lld blocks behind\n", (long long)lag);
-        else         Serial.println("Indexer: fully synced");
+        if (tip != UINT64_MAX) {
+            int64_t lag = (int64_t)tip - (int64_t)idxTip.blockNumber;
+            if (lag > 0) Serial.printf("Indexer lag: %lld blocks behind\n", (long long)lag);
+            else         Serial.println("Indexer: fully synced");
+        }
     }
 }
 
 void loop() {
-    // Poll tip every 10 seconds
     delay(10000);
     uint64_t tip = ckb.getTipBlockNumber();
     if (tip != UINT64_MAX)
