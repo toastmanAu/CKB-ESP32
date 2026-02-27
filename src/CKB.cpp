@@ -1323,6 +1323,15 @@ CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeU
                 return CKB_OK;
             }
             Serial.printf("[CKB] send_transaction rejected: %s\n", msg);
+        } else {
+            /* _rpcCallStatic returned false but no error field in doc —
+             * can happen when relay response triggers ArduinoJson parse edge case.
+             * If result is a valid 66-char tx hash, treat as success. */
+            const char* hash = doc["result"] | "";
+            if (strlen(hash) == 66 && hash[0] == '0' && hash[1] == 'x') {
+                if (txHashOut) strncpy(txHashOut, hash, 67);
+                return CKB_OK;
+            }
         }
         return CKB_ERR_RPC;
     }
