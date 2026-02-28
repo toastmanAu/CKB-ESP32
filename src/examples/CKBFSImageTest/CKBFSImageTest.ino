@@ -7,7 +7,7 @@
  * Workflow:
  *   1. Download image from IMAGE_URL
  *   2. Display original on TFT
- *   3. Re-encode to JPEG at IMAGE_QUALITY (compress)
+ *   3. Display original, then upload as-is (no recompression)
  *   4. Estimate + log CKBFS storage cost
  *   5. Publish image to CKB chain via CKBFS
  *   6. Wait for tx confirmation (~6s blocks)
@@ -22,7 +22,6 @@
  *   toastmanAu/CKB-ESP32
  *   bodmer/TFT_eSPI
  *   bodmer/TJpgDec
- *   bitbank2/JPEGENC
  *
  * Telegram delivery: uses raw HTTP POST (no TelegramSerial dependency).
  * TelegramSerial requires WiFi creds in constructor — not compatible here
@@ -48,8 +47,11 @@
 
 // Image source — direct link to a JPEG (PNG won't decode on TJpgDec)
 // Keep under 100KB for reliable download on CYD SRAM budget
-#define IMAGE_URL        ""    // e.g. "http://example.com/photo.jpg"
-#define IMAGE_FILENAME   ""    // e.g. "test.jpg"
+// Test image: RUN CKB logo (183KB JPEG, 2752x1536, fits in one CKBFS tx)
+// Host this file somewhere accessible to the CYD over WiFi
+// e.g. python3 -m http.server 8000 in the workspace dir, then use LAN IP
+#define IMAGE_URL        ""    // e.g. "http://192.168.68.87:8000/run-ckb-ckbfs-test.jpg"
+#define IMAGE_FILENAME   "run-ckb-ckbfs-test.jpg"
 
 // JPEG re-encode quality (1=tiny/low quality, 100=large/lossless)
 // 50-70 is a good balance for this test
@@ -63,7 +65,7 @@
 //  MEMORY BUDGET (CYD has ~300KB usable heap after WiFi+TFT)
 //  Keep image source under this limit
 // ═══════════════════════════════════════════════════════════════════
-#define IMG_BUF_SIZE  (90 * 1024)   // 90KB per buffer × 3 = 270KB total
+#define IMG_BUF_SIZE  (200 * 1024)  // 200KB — fits 183KB RUN CKB test image
 
 // ═══════════════════════════════════════════════════════════════════
 //  INCLUDES
@@ -73,7 +75,6 @@
 #include <HTTPClient.h>
 #include <TFT_eSPI.h>
 #include <TJpgDec.h>
-#include <JPEGENC.h>
 #include "CKB.h"
 #include "CKBSigner.h"
 #include "ckbfs.h"
@@ -243,79 +244,6 @@ bool tg_send_photo(const uint8_t *jpeg, size_t len, const char *caption) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  JPEG RE-ENCODE (TJpgDec RGB565 → JPEGENC)
-// ═══════════════════════════════════════════════════════════════════
-
-// TJpgDec RGB565 capture into a heap buffer for JPEGENC
-static uint16_t *s_rgb565   = nullptr;
-static uint16_t  s_cap_w    = 0;
-static uint16_t  s_cap_h    = 0;
-
-bool capture_block(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bmp) {
-    if (!s_rgb565) return false;
-    for (int row = 0; row < h && (y + row) < s_cap_h; row++) {
-        memcpy(s_rgb565 + (y + row) * s_cap_w + x,
-               bmp + row * w,
-               w * sizeof(uint16_t));
-    }
-    return true;
-}
-
-bool reencode_jpeg(const uint8_t *src, size_t src_len, int quality,
-                   uint8_t *out, size_t out_size, size_t *out_len) {
-    uint16_t iw, ih;
-    TJpgDec.setJpgScale(1);
-    TJpgDec.getJpgSize(&iw, &ih, src, src_len);
-    if (!iw || !ih) return false;
-
-    // Scale to fit 320×240
-    uint8_t scale = 1;
-    while ((iw / scale) > 320 || (ih / scale) > 240) scale *= 2;
-    TJpgDec.setJpgScale(scale);
-    iw /= scale; ih /= scale;
-
-    // Allocate RGB565 decode buffer
-    size_t rgb_bytes = iw * ih * sizeof(uint16_t);
-    s_rgb565 = (uint16_t *)malloc(rgb_bytes);
-    if (!s_rgb565) {
-        Serial.printf("[ENC] OOM for RGB565 buf (%zu bytes)\n", rgb_bytes);
-        return false;
-    }
-    memset(s_rgb565, 0, rgb_bytes);
-
-    s_cap_w = iw; s_cap_h = ih;
-    TJpgDec.setCallback(capture_block);
-    TJpgDec.drawJpg(0, 0, src, src_len);
-
-    // JPEGENC: RGB565 → JPEG
-    JPEGENC jpg;
-    JPEGENCODE enc;
-    int buf_len = jpg.open(out, out_size);
-    if (!buf_len) {
-        free(s_rgb565); s_rgb565 = nullptr;
-        Serial.println("[ENC] JPEGENC open failed");
-        return false;
-    }
-    int rc = jpg.encodeBegin(&enc, iw, ih, JPEG_PIXEL_RGB565,
-                              JPEG_SUBSAMPLE_420, quality);
-    if (rc != JPEGE_SUCCESS) {
-        free(s_rgb565); s_rgb565 = nullptr;
-        Serial.printf("[ENC] encodeBegin failed: %d\n", rc);
-        return false;
-    }
-    rc = jpg.addFrame(&enc, (uint8_t *)s_rgb565, iw * sizeof(uint16_t));
-    if (rc != JPEGE_SUCCESS) {
-        free(s_rgb565); s_rgb565 = nullptr;
-        Serial.printf("[ENC] addFrame failed: %d\n", rc);
-        return false;
-    }
-    *out_len = jpg.close();
-
-    free(s_rgb565); s_rgb565 = nullptr;
-    return *out_len > 0;
-}
-
-// ═══════════════════════════════════════════════════════════════════
 //  CONFIRMATION POLL
 // ═══════════════════════════════════════════════════════════════════
 
@@ -358,11 +286,12 @@ void setup() {
         while (1) delay(1000);
     }
 
-    // Allocate image buffers from heap
+    // Two buffers: src (download + upload) and chain (retrieved from chain)
+    // No re-encode step — upload original JPEG directly
     s_src_buf   = (uint8_t *)malloc(IMG_BUF_SIZE);
-    s_enc_buf   = (uint8_t *)malloc(IMG_BUF_SIZE);
     s_chain_buf = (uint8_t *)malloc(IMG_BUF_SIZE);
-    if (!s_src_buf || !s_enc_buf || !s_chain_buf) {
+    s_enc_buf   = s_src_buf;  // alias — enc == src, no copy needed
+    if (!s_src_buf || !s_chain_buf) {
         status(20, "OOM — reduce IMG_BUF_SIZE", TFT_RED);
         Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
         while (1) delay(1000);
@@ -410,28 +339,19 @@ void setup() {
     display_jpeg(s_src_buf, s_src_len, "Original");
     delay(2500);
 
-    // ── 3. RE-ENCODE (COMPRESS) ───────────────────────────────────
-    tft.fillScreen(TFT_BLACK);
-    snprintf(msg, sizeof(msg), "3/8 Compressing (Q%d)...", IMAGE_QUALITY);
-    status(4, msg);
-    t0 = millis();
-    if (!reencode_jpeg(s_src_buf, s_src_len, IMAGE_QUALITY,
-                       s_enc_buf, IMG_BUF_SIZE, &s_enc_len)) {
-        status(14, "Encode failed!", TFT_RED);
-        tg_send_text("❌ JPEG encode failed"); while (1) delay(1000);
-    }
-    t_encode_ms = millis() - t0;
-    float ratio = (float)s_src_len / s_enc_len;
-    snprintf(msg, sizeof(msg), "3/8 %zuKB→%zuKB (%.1fx) %ums",
-             s_src_len/1024, s_enc_len/1024, ratio, t_encode_ms);
-    status(14, msg, TFT_GREEN);
+    // ── 3. SKIP RE-ENCODE — upload original JPEG as-is ──────────
+    // enc_buf aliases src_buf — no copy. CYD auto-scales on display.
+    t_encode_ms = 0;
+    s_enc_len = s_src_len;  // enc_buf == src_buf (aliased)
+    float ratio = 1.0f;
+    status(4, "3/8 Using original JPEG (no recompression)", TFT_GREEN);
 
     // ── 4. COST ESTIMATE ─────────────────────────────────────────
     ckbfs_cost_t cost;
     ckbfs_estimate_cost(s_enc_len, IMAGE_FILENAME, "image/jpeg", false, &cost);
     snprintf(msg, sizeof(msg), "4/8 Cost: %lluCKB locked, %.5f fee",
              cost.capacity_ckb, cost.fee_shannon / 1e8);
-    status(24, msg, TFT_CYAN);
+    status(14, msg, TFT_CYAN);
     Serial.printf("CKBFS cost: %llu CKB capacity, %llu shannon fee, %zu txs\n",
                   cost.capacity_ckb, cost.fee_shannon, cost.tx_count);
 
@@ -550,8 +470,7 @@ void setup() {
     tft.drawString(String(s_tx_hash).substring(0, 20) + "...", 4, 60);
 
     // Free buffers
-    free(s_src_buf);
-    free(s_enc_buf);
+    free(s_src_buf);    // enc_buf aliases src_buf — do not free separately
     free(s_chain_buf);
 }
 
