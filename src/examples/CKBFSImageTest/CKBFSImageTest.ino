@@ -1,345 +1,212 @@
 /*
- * CKBFSImageTest.ino — Store an image on CKB chain, retrieve and view it
- * =======================================================================
+ * CKBFSImageTest.ino — Store a JPEG on CKB chain, retrieve, display, report
+ * ===========================================================================
  * Hardware: ESP32-2432S028R (CYD — Cheap Yellow Display)
- *   - ILI9341 320×240 TFT (SPI)
- *   - XPT2046 touch (SPI, shared bus)
- *   - ESP32-D0WD-V3 (4MB flash, 520KB SRAM)
+ *   ILI9341 320×240 TFT · XPT2046 touch · ESP32 (no PSRAM)
  *
  * Workflow:
  *   1. Download image from IMAGE_URL
- *   2. JPEG decode → RGB565 framebuffer → display it
+ *   2. Display original on TFT
  *   3. Re-encode to JPEG at IMAGE_QUALITY (compress)
- *   4. Estimate CKBFS storage cost, log to Telegram
- *   5. Publish to CKB chain via CKBFS
- *   6. Wait for confirmation (~6 second blocks)
- *   7. Download back from chain (raw bytes from witness)
- *   8. JPEG decode → display on TFT (verify round-trip)
- *   9. Send image + stats report to Telegram chat
+ *   4. Estimate + log CKBFS storage cost
+ *   5. Publish image to CKB chain via CKBFS
+ *   6. Wait for tx confirmation (~6s blocks)
+ *   7. Retrieve raw bytes back from chain witness
+ *   8. Display retrieved image, verify byte-for-byte match
+ *   9. Send stats report + image to Telegram
  *
- * Fill in config below — no variables are hardcoded.
- * All results (speed, size, cost, tx hash) sent to your Telegram chat.
+ * No hardcoded values — fill in config below, then flash.
+ * Provide IMAGE_URL here in chat or via serial monitor.
  *
- * Dependencies (PlatformIO / Arduino Library Manager):
- *   - CKB-ESP32         (toastmanAu/CKB-ESP32)
- *   - TelegramSerial    (toastmanAu/TelegramSerial) -- for report delivery
- *   - TFT_eSPI          (Bodmer) -- ILI9341 driver for CYD
- *   - TJpgDec           (Bodmer) -- JPEG decoder (tiny, fits in SRAM)
- *   - esp32             (espressif) -- includes esp_camera JPEG encoder
+ * Dependencies (add to platformio.ini lib_deps):
+ *   toastmanAu/CKB-ESP32
+ *   bodmer/TFT_eSPI
+ *   bodmer/TJpgDec
+ *   bitbank2/JPEGENC
  *
+ * Telegram delivery: uses raw HTTP POST (no TelegramSerial dependency).
+ * TelegramSerial requires WiFi creds in constructor — not compatible here
+ * since we manage WiFi ourselves for better control.
+ *
+ * PlatformIO env: see platformio_ckbfstest.ini
  * Repo: toastmanAu/CKB-ESP32 · examples/CKBFSImageTest
  */
 
 // ═══════════════════════════════════════════════════════════════════
-//  CONFIG — fill these in, no defaults provided
+//  CONFIG — fill all fields, nothing has a default
 // ═══════════════════════════════════════════════════════════════════
 
-// WiFi
-#define WIFI_SSID       ""          // your WiFi SSID
-#define WIFI_PASS       ""          // your WiFi password
+#define WIFI_SSID        ""    // your WiFi SSID
+#define WIFI_PASS        ""    // your WiFi password
 
-// CKB node (full node with RPC open)
-#define CKB_NODE_URL    ""          // e.g. "http://192.168.68.87:8114"
+// CKB full node RPC (must have get_transaction, send_transaction)
+#define CKB_NODE_URL     ""    // e.g. "http://192.168.68.87:8114"
 
-// CKB wallet — private key hex (no 0x prefix), needs ~200 CKB funded
-#define PRIVKEY_HEX     ""          // 64 hex chars
+// Funded wallet — needs at least 200 CKB (covers capacity + fees)
+// 64 hex chars, no 0x prefix
+#define PRIVKEY_HEX      ""
 
-// Image to store — direct URL to a JPEG or PNG
-// Recommended: small image, <200KB, publicly accessible
-#define IMAGE_URL       ""          // e.g. "http://example.com/photo.jpg"
-#define IMAGE_FILENAME  ""          // e.g. "test-image.jpg"
+// Image source — direct link to a JPEG (PNG won't decode on TJpgDec)
+// Keep under 100KB for reliable download on CYD SRAM budget
+#define IMAGE_URL        ""    // e.g. "http://example.com/photo.jpg"
+#define IMAGE_FILENAME   ""    // e.g. "test.jpg"
 
-// JPEG re-encode quality (1–100). Lower = smaller file, more compression.
-// 60 is a good balance. 90 is near-lossless.
-#define IMAGE_QUALITY   60
+// JPEG re-encode quality (1=tiny/low quality, 100=large/lossless)
+// 50-70 is a good balance for this test
+#define IMAGE_QUALITY    60
 
-// Telegram for result delivery (TelegramSerial)
-#define TG_BOT_TOKEN    ""          // your bot token
-#define TG_CHAT_ID      ""          // your chat ID (e.g. "1790655432")
+// Telegram bot — for report delivery
+#define TG_BOT_TOKEN     ""    // "1234567890:AAF..."
+#define TG_CHAT_ID       ""    // your chat ID, e.g. "1790655432"
+
+// ═══════════════════════════════════════════════════════════════════
+//  MEMORY BUDGET (CYD has ~300KB usable heap after WiFi+TFT)
+//  Keep image source under this limit
+// ═══════════════════════════════════════════════════════════════════
+#define IMG_BUF_SIZE  (90 * 1024)   // 90KB per buffer × 3 = 270KB total
 
 // ═══════════════════════════════════════════════════════════════════
 //  INCLUDES
 // ═══════════════════════════════════════════════════════════════════
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <TFT_eSPI.h>
 #include <TJpgDec.h>
+#include <JPEGENC.h>
 #include "CKB.h"
 #include "CKBSigner.h"
 #include "ckbfs.h"
 
-// TelegramSerial for report delivery
-#define TELEGRAM_BOT_TOKEN TG_BOT_TOKEN
-#define TELEGRAM_CHAT_ID   TG_CHAT_ID
-#include <TelegramSerial.h>
-TelegramSerial tg(&Serial);
-
 // ═══════════════════════════════════════════════════════════════════
-//  CYD DISPLAY PINS (ESP32-2432S028R)
+//  GLOBALS
 // ═══════════════════════════════════════════════════════════════════
-// TFT_eSPI configured via User_Setup.h or build flags.
-// CYD pin mapping (for reference):
-//   TFT_MOSI=13, TFT_SCLK=14, TFT_CS=15, TFT_DC=2, TFT_RST=-1, TFT_BL=21
-//   Touch: TOUCH_CS=33 (shared SPI bus)
-
 TFT_eSPI tft = TFT_eSPI();
 
-// ═══════════════════════════════════════════════════════════════════
-//  BUFFERS
-// ═══════════════════════════════════════════════════════════════════
+// Image buffers — heap-allocated in setup() to avoid BSS overflow
+static uint8_t *s_src_buf   = nullptr;   // downloaded source JPEG
+static uint8_t *s_enc_buf   = nullptr;   // re-encoded (compressed) JPEG
+static uint8_t *s_chain_buf = nullptr;   // retrieved from chain
 
-// Raw downloaded image bytes (before re-encode)
-static uint8_t s_raw_buf[200 * 1024];   // 200KB — enough for most source images
-static size_t  s_raw_len = 0;
+static size_t s_src_len   = 0;
+static size_t s_enc_len   = 0;
+static size_t s_chain_len = 0;
 
-// Re-encoded JPEG bytes (what we store on chain)
-static uint8_t s_jpeg_buf[200 * 1024];
-static size_t  s_jpeg_len = 0;
-
-// Retrieved bytes from chain (should match s_jpeg_buf)
-static uint8_t s_chain_buf[200 * 1024];
-static size_t  s_chain_len = 0;
-
-// Display framebuffer (320×240 RGB565 = 150KB — tight, use DRAM)
-static uint16_t s_fb[320 * 240];
-
-// Confirmed tx hash
 static char s_tx_hash[67] = {};
 
-// ═══════════════════════════════════════════════════════════════════
-//  TIMING
-// ═══════════════════════════════════════════════════════════════════
-static unsigned long t_download_start, t_download_end;
-static unsigned long t_encode_start,   t_encode_end;
-static unsigned long t_publish_start,  t_publish_end;
-static unsigned long t_confirm_start,  t_confirm_end;
-static unsigned long t_retrieve_start, t_retrieve_end;
-static unsigned long t_total_start;
+// TJpgDec render target
+static uint16_t s_render_x = 0, s_render_y = 0;
+
+// Timing
+static uint32_t t_total_start;
+static uint32_t t_download_ms, t_encode_ms, t_publish_ms,
+                t_confirm_ms,  t_retrieve_ms;
 
 // ═══════════════════════════════════════════════════════════════════
-//  TJpgDec callback — writes decoded pixels into s_fb
+//  DISPLAY HELPERS
 // ═══════════════════════════════════════════════════════════════════
-static uint16_t s_tft_x = 0, s_tft_y = 0;
-static uint16_t s_disp_w = 320, s_disp_h = 240;
 
-static bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-    if (y >= s_disp_h) return false;
-    // Store into framebuffer
-    for (int row = 0; row < h && (y + row) < s_disp_h; row++) {
-        for (int col = 0; col < w && (x + col) < s_disp_w; col++) {
-            s_fb[(y + row) * s_disp_w + (x + col)] = bitmap[row * w + col];
-        }
-    }
+// TJpgDec callback — writes directly to TFT (no framebuffer needed)
+bool tft_block(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bmp) {
+    if (y >= tft.height()) return false;
+    tft.pushImage(x + s_render_x, y + s_render_y, w, h, bmp);
     return true;
 }
 
-static void display_jpeg(const uint8_t *data, size_t len, const char *label) {
+void display_jpeg(const uint8_t *data, size_t len, const char *label) {
     tft.fillScreen(TFT_BLACK);
-    TJpgDec.setCallback(tft_output);
-    TJpgDec.setJpgScale(1);
-    memset(s_fb, 0, sizeof(s_fb));
 
     uint16_t iw, ih;
+    TJpgDec.setCallback(tft_block);
     TJpgDec.getJpgSize(&iw, &ih, data, len);
 
-    // Scale to fit 320×240
     uint8_t scale = 1;
-    while (iw/scale > 320 || ih/scale > 240) scale *= 2;
+    while ((iw / scale) > 320 || (ih / scale) > 240) scale *= 2;
     TJpgDec.setJpgScale(scale);
 
-    s_tft_x = (320 - iw/scale) / 2;
-    s_tft_y = (240 - ih/scale) / 2;
-    s_disp_w = 320; s_disp_h = 240;
+    s_render_x = (320 - iw / scale) / 2;
+    s_render_y = (240 - ih / scale) / 2;
+    TJpgDec.drawJpg(0, 0, data, len);
 
-    TJpgDec.drawJpg(s_tft_x, s_tft_y, data, len);
-
-    // Push framebuffer to TFT
-    tft.pushImage(0, 0, 320, 240, s_fb);
-
-    // Label overlay
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    // Label bar at bottom
+    tft.fillRect(0, 224, 320, 16, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.setTextSize(1);
-    tft.drawString(label, 4, 4);
+    tft.drawString(label, 4, 226);
+}
+
+void status(int y, const char *msg, uint16_t colour = TFT_WHITE) {
+    tft.fillRect(0, y, 320, 14, TFT_BLACK);
+    tft.setTextColor(colour, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.drawString(msg, 4, y);
+    Serial.println(msg);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  HTTP download into buffer
+//  HTTP HELPERS
 // ═══════════════════════════════════════════════════════════════════
-static bool http_download(const char *url, uint8_t *buf, size_t buf_size, size_t *out_len) {
+
+bool http_download(const char *url, uint8_t *buf, size_t limit, size_t *out) {
     HTTPClient http;
     http.begin(url);
-    http.setTimeout(30000);
+    http.setTimeout(20000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     int code = http.GET();
     if (code != 200) {
-        Serial.printf("[CKBFS] HTTP %d for %s\n", code, url);
-        http.end();
-        return false;
+        Serial.printf("[DL] HTTP %d\n", code);
+        http.end(); return false;
     }
-    int content_len = http.getSize();
-    if (content_len > (int)buf_size) {
-        Serial.printf("[CKBFS] Image too large: %d > %d\n", content_len, (int)buf_size);
-        http.end();
-        return false;
+    int clen = http.getSize();
+    if (clen > (int)limit) {
+        Serial.printf("[DL] Too large: %d > %d\n", clen, (int)limit);
+        http.end(); return false;
     }
     WiFiClient *stream = http.getStreamPtr();
     size_t total = 0;
-    while (http.connected() && total < (size_t)content_len) {
-        size_t avail = stream->available();
-        if (avail) {
-            size_t r = stream->readBytes(buf + total, min(avail, buf_size - total));
-            total += r;
+    uint32_t deadline = millis() + 20000;
+    while (millis() < deadline && (clen < 0 || total < (size_t)clen)) {
+        if (stream->available()) {
+            total += stream->readBytes(buf + total, min(stream->available(), (int)(limit - total)));
+        } else {
+            if (!http.connected()) break;
+            delay(5);
         }
-        delay(1);
     }
-    *out_len = total;
     http.end();
+    *out = total;
     return total > 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  JPEG re-encode using esp_jpg_encode (esp32 built-in)
-// ═══════════════════════════════════════════════════════════════════
-// We decode the source JPEG → RGB888, then re-encode at target quality.
-// This lets us control compression ratio.
-
-static uint8_t  *s_rgb_buf    = nullptr;   // heap-allocated RGB888
-static size_t    s_rgb_w = 0, s_rgb_h = 0;
-static size_t    s_rgb_len = 0;
-
-// TJpgDec callback to build RGB888 buffer
-static bool rgb_capture(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-    if (!s_rgb_buf) return false;
-    for (int row = 0; row < h && (uint16_t)(y+row) < s_rgb_h; row++) {
-        for (int col = 0; col < w && (uint16_t)(x+col) < s_rgb_w; col++) {
-            uint16_t px = bitmap[row*w + col];
-            size_t idx = ((y+row) * s_rgb_w + (x+col)) * 3;
-            s_rgb_buf[idx+0] = ((px >> 11) & 0x1F) << 3;  // R
-            s_rgb_buf[idx+1] = ((px >>  5) & 0x3F) << 2;  // G
-            s_rgb_buf[idx+2] = ( px        & 0x1F) << 3;  // B
-        }
-    }
-    return true;
-}
-
-// esp_jpg_encode output callback
-static bool jpg_encode_cb(void *arg, size_t index, const uint8_t *data, size_t len) {
-    if (s_jpeg_len + len > sizeof(s_jpeg_buf)) return false;
-    memcpy(s_jpeg_buf + s_jpeg_len, data, len);
-    s_jpeg_len += len;
-    return true;
-}
-
-static bool reencode_jpeg(const uint8_t *src, size_t src_len, int quality) {
-    uint16_t iw, ih;
-    TJpgDec.setJpgScale(1);
-    TJpgDec.getJpgSize(&iw, &ih, src, src_len);
-    if (iw == 0 || ih == 0) return false;
-
-    // Cap to 320×240 — CYD display size
-    uint8_t scale = 1;
-    while (iw/scale > 320 || ih/scale > 240) scale *= 2;
-    iw /= scale; ih /= scale;
-    TJpgDec.setJpgScale(scale);
-
-    s_rgb_w = iw; s_rgb_h = ih;
-    s_rgb_len = iw * ih * 3;
-    s_rgb_buf = (uint8_t*)ps_malloc(s_rgb_len);   // PSRAM not available on CYD — use heap
-    if (!s_rgb_buf) s_rgb_buf = (uint8_t*)malloc(s_rgb_len);
-    if (!s_rgb_buf) { Serial.println("[CKBFS] OOM for RGB buffer"); return false; }
-    memset(s_rgb_buf, 0, s_rgb_len);
-
-    TJpgDec.setCallback(rgb_capture);
-    TJpgDec.drawJpg(0, 0, src, src_len);  // populates s_rgb_buf
-
-    // Re-encode
-    s_jpeg_len = 0;
-    // esp_jpg_encode: (void* src, esp_jpg_src_type, w, h, format, quality, cb, arg, chunksize)
-    // Available as frame2jpg() when using esp_camera — fall back to writing raw RGB565 JPEG
-    // via a minimal JFIF writer since esp32 non-camera builds don't expose frame2jpg.
-    //
-    // We use TJpgDec's output + a tiny JFIF wrapper.
-    // For real JPEG encoding on CYD (no PSRAM, no camera), best option is JPEGENC library.
-    // This sketch requires JPEGENC (Larry Bank):
-    //   pio: lib_deps = bitbank2/JPEGENC
-    //   Arduino: install "JPEGENC" by Larry Bank
-
-    // JPEGENC is #included conditionally:
-    #ifdef JPEGENC_H__
-    JPEGENCODE jpe;
-    JPEGENC jpg;
-    jpg.open(s_jpeg_buf, sizeof(s_jpeg_buf));
-    jpe.cx = jpe.cy = 0;
-    jpe.iWidth = iw; jpe.iHeight = ih;
-    jpe.iQFactor = quality;
-    jpe.ucPixelType = JPEG_PIXEL_RGB888;
-    jpe.iStride = iw * 3;
-    jpe.iMCUCount = 0; jpe.pPixels = s_rgb_buf;
-    jpg.addFrame(&jpe);
-    s_jpeg_len = jpg.close();
-    #else
-    // Fallback: store raw RGB565 as-is with minimal BMP header
-    // (not JPEG, but still valid binary — CKBFS stores any bytes)
-    Serial.println("[CKBFS] JPEGENC not found — storing re-decoded RGB565 as BMP");
-    // 54-byte BMP header
-    uint32_t row_sz = iw * 2;
-    uint32_t file_sz = 54 + ih * row_sz;
-    s_jpeg_buf[0]='B'; s_jpeg_buf[1]='M';
-    memcpy(s_jpeg_buf+2,  &file_sz, 4);
-    memset(s_jpeg_buf+6,  0, 4);
-    uint32_t off=54; memcpy(s_jpeg_buf+10, &off, 4);
-    uint32_t hdr=40; memcpy(s_jpeg_buf+14, &hdr, 4);
-    memcpy(s_jpeg_buf+18, &iw, 4); memcpy(s_jpeg_buf+22, &ih, 4);
-    s_jpeg_buf[26]=1; s_jpeg_buf[27]=0;  // planes=1
-    uint16_t bpp=16; memcpy(s_jpeg_buf+28, &bpp, 2);
-    memset(s_jpeg_buf+30, 0, 24);
-    for (uint32_t r=0; r<ih; r++) {
-        // BMP stores bottom-up
-        memcpy(s_jpeg_buf + 54 + r*row_sz,
-               s_fb + (ih-1-r)*iw,
-               row_sz);
-    }
-    s_jpeg_len = file_sz;
-    #endif
-
-    free(s_rgb_buf); s_rgb_buf = nullptr;
-    return s_jpeg_len > 0;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Wait for tx confirmation
-// ═══════════════════════════════════════════════════════════════════
-static bool wait_confirmed(CKBClient &ckb, const char *tx_hash, uint32_t timeout_ms) {
-    uint32_t start = millis();
-    char resp[512];
-    while (millis() - start < timeout_ms) {
-        // get_transaction status
-        char body[200];
-        snprintf(body, sizeof(body),
-            "{\"jsonrpc\":\"2.0\",\"method\":\"get_transaction\","
-            "\"params\":[\"%s\"],\"id\":1}", tx_hash);
-        if (ckb.rpcCall(body, resp, sizeof(resp))) {
-            if (strstr(resp, "\"committed\"")) return true;
-        }
-        tft.drawString("Waiting for confirm...", 4, 220);
-        delay(2000);
-    }
-    return false;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  SEND IMAGE TO TELEGRAM
-// ═══════════════════════════════════════════════════════════════════
-static void send_image_to_telegram(const uint8_t *jpeg, size_t len, const char *caption) {
-    // Use HTTP multipart upload to Telegram sendPhoto API
+// Send text message to Telegram
+bool tg_send_text(const char *msg) {
     HTTPClient http;
     char url[128];
-    snprintf(url, sizeof(url),
-             "https://api.telegram.org/bot%s/sendPhoto", TG_BOT_TOKEN);
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage", TG_BOT_TOKEN);
     http.begin(url);
+    http.addHeader("Content-Type", "application/json");
 
-    String boundary = "----CKBFSBoundary";
+    // Escape newlines in message for JSON
+    String body = "{\"chat_id\":\"";
+    body += TG_CHAT_ID;
+    body += "\",\"text\":\"";
+    String m(msg);
+    m.replace("\\", "\\\\");
+    m.replace("\"", "\\\"");
+    m.replace("\n", "\\n");
+    body += m;
+    body += "\"}";
+
+    int code = http.POST(body);
+    http.end();
+    Serial.printf("[TG] text: %d\n", code);
+    return code == 200;
+}
+
+// Send image file to Telegram via sendPhoto (multipart/form-data)
+bool tg_send_photo(const uint8_t *jpeg, size_t len, const char *caption) {
+    // Build complete multipart body in one allocation
+    const String boundary = "CKBFSBnd";
     String head = "--" + boundary + "\r\n"
                   "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
                   + String(TG_CHAT_ID) + "\r\n"
@@ -351,225 +218,344 @@ static void send_image_to_telegram(const uint8_t *jpeg, size_t len, const char *
                   "Content-Type: image/jpeg\r\n\r\n";
     String tail = "\r\n--" + boundary + "--\r\n";
 
-    size_t total = head.length() + len + tail.length();
-    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-    http.addHeader("Content-Length", String(total));
+    size_t total_len = head.length() + len + tail.length();
 
-    // Streaming upload
-    WiFiClient *client = http.getStreamPtr();
-    http.sendRequest("POST", (uint8_t*)head.c_str(), head.length());
-    // Note: for large images, chunked send is better — simplified here
-    http.sendRequest("POST", (uint8_t*)jpeg, len);
-    http.sendRequest("POST", (uint8_t*)tail.c_str(), tail.length());
-    int code = http.POST((uint8_t*)nullptr, 0);
-    Serial.printf("[TG] sendPhoto: %d\n", code);
+    // Allocate combined body
+    uint8_t *body = (uint8_t *)malloc(total_len);
+    if (!body) {
+        Serial.printf("[TG] OOM for photo body (%zu bytes)\n", total_len);
+        return false;
+    }
+    memcpy(body, head.c_str(), head.length());
+    memcpy(body + head.length(), jpeg, len);
+    memcpy(body + head.length() + len, tail.c_str(), tail.length());
+
+    HTTPClient http;
+    char url[128];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendPhoto", TG_BOT_TOKEN);
+    http.begin(url);
+    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    int code = http.POST(body, total_len);
     http.end();
+    free(body);
+    Serial.printf("[TG] photo: %d\n", code);
+    return code == 200;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SETUP
+//  JPEG RE-ENCODE (TJpgDec RGB565 → JPEGENC)
 // ═══════════════════════════════════════════════════════════════════
+
+// TJpgDec RGB565 capture into a heap buffer for JPEGENC
+static uint16_t *s_rgb565   = nullptr;
+static uint16_t  s_cap_w    = 0;
+static uint16_t  s_cap_h    = 0;
+
+bool capture_block(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bmp) {
+    if (!s_rgb565) return false;
+    for (int row = 0; row < h && (y + row) < s_cap_h; row++) {
+        memcpy(s_rgb565 + (y + row) * s_cap_w + x,
+               bmp + row * w,
+               w * sizeof(uint16_t));
+    }
+    return true;
+}
+
+bool reencode_jpeg(const uint8_t *src, size_t src_len, int quality,
+                   uint8_t *out, size_t out_size, size_t *out_len) {
+    uint16_t iw, ih;
+    TJpgDec.setJpgScale(1);
+    TJpgDec.getJpgSize(&iw, &ih, src, src_len);
+    if (!iw || !ih) return false;
+
+    // Scale to fit 320×240
+    uint8_t scale = 1;
+    while ((iw / scale) > 320 || (ih / scale) > 240) scale *= 2;
+    TJpgDec.setJpgScale(scale);
+    iw /= scale; ih /= scale;
+
+    // Allocate RGB565 decode buffer
+    size_t rgb_bytes = iw * ih * sizeof(uint16_t);
+    s_rgb565 = (uint16_t *)malloc(rgb_bytes);
+    if (!s_rgb565) {
+        Serial.printf("[ENC] OOM for RGB565 buf (%zu bytes)\n", rgb_bytes);
+        return false;
+    }
+    memset(s_rgb565, 0, rgb_bytes);
+
+    s_cap_w = iw; s_cap_h = ih;
+    TJpgDec.setCallback(capture_block);
+    TJpgDec.drawJpg(0, 0, src, src_len);
+
+    // JPEGENC: RGB565 → JPEG
+    JPEGENC jpg;
+    JPEGENCODE enc;
+    int buf_len = jpg.open(out, out_size);
+    if (!buf_len) {
+        free(s_rgb565); s_rgb565 = nullptr;
+        Serial.println("[ENC] JPEGENC open failed");
+        return false;
+    }
+    int rc = jpg.encodeBegin(&enc, iw, ih, JPEG_PIXEL_RGB565,
+                              JPEG_SUBSAMPLE_420, quality);
+    if (rc != JPEGE_SUCCESS) {
+        free(s_rgb565); s_rgb565 = nullptr;
+        Serial.printf("[ENC] encodeBegin failed: %d\n", rc);
+        return false;
+    }
+    rc = jpg.addFrame(&enc, (uint8_t *)s_rgb565, iw * sizeof(uint16_t));
+    if (rc != JPEGE_SUCCESS) {
+        free(s_rgb565); s_rgb565 = nullptr;
+        Serial.printf("[ENC] addFrame failed: %d\n", rc);
+        return false;
+    }
+    *out_len = jpg.close();
+
+    free(s_rgb565); s_rgb565 = nullptr;
+    return *out_len > 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONFIRMATION POLL
+// ═══════════════════════════════════════════════════════════════════
+
+bool wait_confirmed(const char *tx_hash, uint32_t timeout_ms) {
+    CKBClient ckb;
+    ckb.setNodeUrl(CKB_NODE_URL);
+    uint32_t start = millis();
+    while (millis() - start < timeout_ms) {
+        CKBTransaction tx = ckb.getTransaction(tx_hash);
+        if (tx.status == CKB_TX_COMMITTED) return true;
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Confirming... %lus",
+                 (millis() - start) / 1000);
+        status(220, buf, TFT_YELLOW);
+        delay(3000);
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP — one-shot test
+// ═══════════════════════════════════════════════════════════════════
+
 void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Display init
+    // TFT init
     tft.init();
-    tft.setRotation(1);  // landscape
+    tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
     tft.setTextSize(1);
-    tft.drawString("CKBFSImageTest", 4, 4);
+    tft.drawString("CKBFSImageTest v1.0", 4, 4);
 
-    // Config sanity checks
-    if (strlen(WIFI_SSID) == 0 || strlen(PRIVKEY_HEX) == 0 ||
-        strlen(CKB_NODE_URL) == 0 || strlen(IMAGE_URL) == 0 ||
-        strlen(TG_BOT_TOKEN) == 0 || strlen(TG_CHAT_ID) == 0) {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.drawString("CONFIG INCOMPLETE — fill in all fields", 4, 20);
-        Serial.println("ERROR: All config fields must be filled in.");
+    // Config check
+    if (!strlen(WIFI_SSID) || !strlen(PRIVKEY_HEX) || !strlen(CKB_NODE_URL) ||
+        !strlen(IMAGE_URL) || !strlen(TG_BOT_TOKEN) || !strlen(TG_CHAT_ID)) {
+        status(20, "ERROR: Fill in all CONFIG fields", TFT_RED);
         while (1) delay(1000);
     }
 
-    // WiFi
-    tft.drawString("Connecting WiFi...", 4, 20);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries++ < 30) delay(500);
-    if (WiFi.status() != WL_CONNECTED) {
-        tft.setTextColor(TFT_RED); tft.drawString("WiFi failed!", 4, 30); while(1) delay(1000);
+    // Allocate image buffers from heap
+    s_src_buf   = (uint8_t *)malloc(IMG_BUF_SIZE);
+    s_enc_buf   = (uint8_t *)malloc(IMG_BUF_SIZE);
+    s_chain_buf = (uint8_t *)malloc(IMG_BUF_SIZE);
+    if (!s_src_buf || !s_enc_buf || !s_chain_buf) {
+        status(20, "OOM — reduce IMG_BUF_SIZE", TFT_RED);
+        Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+        while (1) delay(1000);
     }
-    tft.drawString("WiFi OK: " + WiFi.localIP().toString(), 4, 30);
-    Serial.println("WiFi: " + WiFi.localIP().toString());
+    Serial.printf("Heap after buffers: %u bytes free\n", ESP.getFreeHeap());
 
-    // Telegram init
-    tg.begin(TG_BOT_TOKEN, TG_CHAT_ID);
+    // WiFi
+    status(20, "Connecting WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts++ < 40) delay(500);
+    if (WiFi.status() != WL_CONNECTED) {
+        status(20, "WiFi failed!", TFT_RED); while (1) delay(1000);
+    }
+    status(20, ("WiFi: " + WiFi.localIP().toString()).c_str(), TFT_GREEN);
 
-    // Load key
+    // Key
     CKBKey key;
     if (!key.loadPrivateKeyHex(PRIVKEY_HEX)) {
-        tft.setTextColor(TFT_RED); tft.drawString("Bad privkey!", 4, 40); while(1) delay(1000);
+        status(30, "Bad privkey!", TFT_RED); while (1) delay(1000);
     }
-    char addr[110]; key.getAddress(addr, sizeof(addr), true);
+    char addr[110];
+    key.getAddress(addr, sizeof(addr), true);
     Serial.println("Wallet: " + String(addr));
-    tg.println("🔑 Wallet: " + String(addr));
+
+    tg_send_text(("🔑 Wallet: " + String(addr) + "\n🚀 CKBFSImageTest starting...").c_str());
 
     t_total_start = millis();
 
-    // ── STEP 1: Download image ────────────────────────────────────
-    tft.drawString("Step 1: Downloading image...", 4, 50);
-    tg.println("📥 Downloading image from URL...");
-    t_download_start = millis();
-    if (!http_download(IMAGE_URL, s_raw_buf, sizeof(s_raw_buf), &s_raw_len)) {
-        tft.setTextColor(TFT_RED); tft.drawString("Download failed!", 4, 60); while(1) delay(1000);
+    // ── 1. DOWNLOAD ───────────────────────────────────────────────
+    status(40, "1/8 Downloading image...");
+    uint32_t t0 = millis();
+    if (!http_download(IMAGE_URL, s_src_buf, IMG_BUF_SIZE, &s_src_len)) {
+        status(40, "Download failed!", TFT_RED);
+        tg_send_text("❌ Download failed"); while (1) delay(1000);
     }
-    t_download_end = millis();
-    Serial.printf("Downloaded %zu bytes in %lums\n", s_raw_len, t_download_end - t_download_start);
+    t_download_ms = millis() - t0;
+    char msg[80];
+    snprintf(msg, sizeof(msg), "1/8 Downloaded: %zuKB in %ums",
+             s_src_len / 1024, t_download_ms);
+    status(40, msg, TFT_GREEN);
 
-    // ── STEP 2: Display original ──────────────────────────────────
-    tft.drawString("Step 2: Displaying original...", 4, 60);
-    display_jpeg(s_raw_buf, s_raw_len, "Original");
-    delay(2000);
+    // ── 2. DISPLAY ORIGINAL ───────────────────────────────────────
+    status(50, "2/8 Displaying original...");
+    display_jpeg(s_src_buf, s_src_len, "Original");
+    delay(2500);
 
-    // ── STEP 3: Re-encode (compress) ─────────────────────────────
+    // ── 3. RE-ENCODE (COMPRESS) ───────────────────────────────────
     tft.fillScreen(TFT_BLACK);
-    tft.drawString("Step 3: Compressing (Q=" + String(IMAGE_QUALITY) + ")...", 4, 4);
-    t_encode_start = millis();
-    if (!reencode_jpeg(s_raw_buf, s_raw_len, IMAGE_QUALITY)) {
-        tft.setTextColor(TFT_RED); tft.drawString("Encode failed!", 4, 14); while(1) delay(1000);
+    snprintf(msg, sizeof(msg), "3/8 Compressing (Q%d)...", IMAGE_QUALITY);
+    status(4, msg);
+    t0 = millis();
+    if (!reencode_jpeg(s_src_buf, s_src_len, IMAGE_QUALITY,
+                       s_enc_buf, IMG_BUF_SIZE, &s_enc_len)) {
+        status(14, "Encode failed!", TFT_RED);
+        tg_send_text("❌ JPEG encode failed"); while (1) delay(1000);
     }
-    t_encode_end = millis();
-    float ratio = (float)s_raw_len / s_jpeg_len;
-    Serial.printf("Re-encoded: %zu → %zu bytes (%.1fx) in %lums\n",
-                  s_raw_len, s_jpeg_len, ratio, t_encode_end - t_encode_start);
+    t_encode_ms = millis() - t0;
+    float ratio = (float)s_src_len / s_enc_len;
+    snprintf(msg, sizeof(msg), "3/8 %zuKB→%zuKB (%.1fx) %ums",
+             s_src_len/1024, s_enc_len/1024, ratio, t_encode_ms);
+    status(14, msg, TFT_GREEN);
 
-    // ── STEP 4: Cost estimate ─────────────────────────────────────
+    // ── 4. COST ESTIMATE ─────────────────────────────────────────
     ckbfs_cost_t cost;
-    ckbfs_estimate_cost(s_jpeg_len, IMAGE_FILENAME, "image/jpeg", false, &cost);
-    Serial.printf("CKBFS cost: %llu CKB locked, %llu shannon fee\n",
-                  cost.capacity_ckb, cost.fee_shannon);
-    tg.printf("📊 Cost estimate: %llu CKB locked (%.6f CKB fee) — %zu txs\n",
-              cost.capacity_ckb, cost.fee_shannon / 1e8, cost.tx_count);
+    ckbfs_estimate_cost(s_enc_len, IMAGE_FILENAME, "image/jpeg", false, &cost);
+    snprintf(msg, sizeof(msg), "4/8 Cost: %lluCKB locked, %.5f fee",
+             cost.capacity_ckb, cost.fee_shannon / 1e8);
+    status(24, msg, TFT_CYAN);
+    Serial.printf("CKBFS cost: %llu CKB capacity, %llu shannon fee, %zu txs\n",
+                  cost.capacity_ckb, cost.fee_shannon, cost.tx_count);
 
-    // ── STEP 5: Publish to CKB chain ─────────────────────────────
-    tft.fillScreen(TFT_BLACK);
-    tft.drawString("Step 5: Publishing to CKB...", 4, 4);
-    tg.println("⛓️ Publishing to CKB chain via CKBFS...");
-    t_publish_start = millis();
-    ckbfs_err_t err = ckbfs_publish(CKB_NODE_URL, key,
-                                     s_jpeg_buf, s_jpeg_len,
-                                     IMAGE_FILENAME, "image/jpeg",
-                                     cost.capacity_ckb + 1,  // +1 CKB buffer
-                                     s_tx_hash);
-    t_publish_end = millis();
-    if (err != CKBFS_OK) {
-        tft.setTextColor(TFT_RED);
-        tft.drawString("Publish failed: " + String((int)err), 4, 14);
-        tg.printf("❌ Publish failed: %d\n", err);
-        while(1) delay(1000);
+    // ── 5. PUBLISH TO CHAIN ───────────────────────────────────────
+    status(34, "5/8 Publishing to CKB...");
+    tg_send_text(("📤 Publishing " + String(s_enc_len/1024) + "KB to CKB chain...").c_str());
+    t0 = millis();
+    ckbfs_err_t ferr = ckbfs_publish(CKB_NODE_URL, key,
+                                      s_enc_buf, s_enc_len,
+                                      IMAGE_FILENAME, "image/jpeg",
+                                      cost.capacity_ckb + 1,
+                                      s_tx_hash);
+    t_publish_ms = millis() - t0;
+    if (ferr != CKBFS_OK) {
+        snprintf(msg, sizeof(msg), "Publish failed: %d", (int)ferr);
+        status(34, msg, TFT_RED);
+        tg_send_text(("❌ Publish failed: " + String((int)ferr)).c_str());
+        while (1) delay(1000);
     }
-    Serial.printf("Published! TX: %s (%lums)\n", s_tx_hash, t_publish_end - t_publish_start);
-    tft.drawString("TX: " + String(s_tx_hash).substring(0, 20) + "...", 4, 14);
-    tg.println("✅ TX submitted: " + String(s_tx_hash));
+    snprintf(msg, sizeof(msg), "5/8 TX submitted (%ums)", t_publish_ms);
+    status(34, msg, TFT_GREEN);
+    Serial.println("TX: " + String(s_tx_hash));
+    tg_send_text(("✅ TX submitted: " + String(s_tx_hash)).c_str());
 
-    // ── STEP 6: Wait for confirmation ────────────────────────────
-    tft.drawString("Step 6: Waiting for confirm (~6s)...", 4, 30);
-    CKBClient ckb; ckb.setNodeUrl(CKB_NODE_URL);
-    t_confirm_start = millis();
-    bool confirmed = wait_confirmed(ckb, s_tx_hash, 120000);
-    t_confirm_end = millis();
-    if (!confirmed) {
-        tft.setTextColor(TFT_YELLOW);
-        tft.drawString("Timeout — continuing anyway", 4, 40);
-        tg.println("⚠️ Confirmation timeout — may still confirm");
+    // ── 6. WAIT FOR CONFIRMATION ──────────────────────────────────
+    status(44, "6/8 Waiting for confirmation...");
+    t0 = millis();
+    bool confirmed = wait_confirmed(s_tx_hash, 180000);  // 3 min max
+    t_confirm_ms = millis() - t0;
+    if (confirmed) {
+        snprintf(msg, sizeof(msg), "6/8 Confirmed in %.1fs", t_confirm_ms / 1000.0f);
+        status(44, msg, TFT_GREEN);
+        tg_send_text(("✅ Confirmed in " + String(t_confirm_ms/1000) + "s").c_str());
     } else {
-        tft.drawString("Confirmed! " + String((t_confirm_end - t_confirm_start)/1000) + "s", 4, 40);
-        tg.printf("✅ Confirmed in %lus\n", (t_confirm_end - t_confirm_start)/1000);
+        status(44, "6/8 Timeout — continuing", TFT_YELLOW);
+        tg_send_text("⚠️ Confirm timeout — retrieving anyway");
     }
 
-    // ── STEP 7: Retrieve from chain ───────────────────────────────
-    tft.drawString("Step 7: Retrieving from chain...", 4, 50);
-    tg.println("📤 Retrieving image from chain...");
-    t_retrieve_start = millis();
-    err = ckbfs_read(CKB_NODE_URL, s_tx_hash, 1,
-                     0,  // skip checksum verify for now
-                     s_chain_buf, sizeof(s_chain_buf), &s_chain_len);
-    t_retrieve_end = millis();
-    if (err != CKBFS_OK) {
-        tft.setTextColor(TFT_RED);
-        tft.drawString("Retrieve failed: " + String((int)err), 4, 60);
-        tg.printf("❌ Retrieve failed: %d\n", err);
-        while(1) delay(1000);
+    // ── 7. RETRIEVE FROM CHAIN ────────────────────────────────────
+    status(54, "7/8 Retrieving from chain...");
+    t0 = millis();
+    ferr = ckbfs_read(CKB_NODE_URL, s_tx_hash, 1, 0,
+                      s_chain_buf, IMG_BUF_SIZE, &s_chain_len);
+    t_retrieve_ms = millis() - t0;
+    if (ferr != CKBFS_OK) {
+        snprintf(msg, sizeof(msg), "Retrieve failed: %d", (int)ferr);
+        status(54, msg, TFT_RED);
+        tg_send_text(("❌ Retrieve failed: " + String((int)ferr)).c_str());
+        while (1) delay(1000);
     }
+    snprintf(msg, sizeof(msg), "7/8 Retrieved %zuKB in %ums",
+             s_chain_len/1024, t_retrieve_ms);
+    status(54, msg, TFT_GREEN);
 
-    // ── STEP 8: Display retrieved image ──────────────────────────
-    bool match = (s_chain_len == s_jpeg_len &&
-                  memcmp(s_chain_buf, s_jpeg_buf, s_jpeg_len) == 0);
-    display_jpeg(s_chain_buf, s_chain_len, match ? "From chain (MATCH)" : "From chain");
-    delay(2000);
+    // ── 8. DISPLAY FROM CHAIN + VERIFY ───────────────────────────
+    bool match = (s_chain_len == s_enc_len &&
+                  memcmp(s_chain_buf, s_enc_buf, s_enc_len) == 0);
+    display_jpeg(s_chain_buf, s_chain_len,
+                 match ? "From chain - MATCH" : "From chain - SIZE MISMATCH");
+    delay(2500);
 
-    // ── STEP 9: Build stats report and send ──────────────────────
-    unsigned long t_total = millis() - t_total_start;
+    // ── 9. REPORT ────────────────────────────────────────────────
+    uint32_t t_total = millis() - t_total_start;
 
-    char report[1024];
+    char report[800];
     snprintf(report, sizeof(report),
         "🖼️ CKBFSImageTest Complete!\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📁 File: %s\n"
-        "📏 Original: %zu bytes (%.1f KB)\n"
-        "🗜️ Compressed (Q%d): %zu bytes (%.1f KB) — %.1fx smaller\n"
-        "🔗 TX Hash: %s\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📁 %s\n"
+        "📏 Source:     %zu bytes (%.1fKB)\n"
+        "🗜️ Compressed: %zu bytes (%.1fKB) Q%d — %.1fx\n"
+        "🔗 TX: %s\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⏱️ Timing:\n"
-        "  Download:  %lums\n"
-        "  Encode:    %lums\n"
-        "  Publish:   %lums\n"
-        "  Confirm:   %lus\n"
-        "  Retrieve:  %lums\n"
-        "  TOTAL:     %lums (%.1fs)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  Download:  %ums\n"
+        "  Encode:    %ums\n"
+        "  Publish:   %ums\n"
+        "  Confirm:   %us\n"
+        "  Retrieve:  %ums\n"
+        "  TOTAL:     %us (%.1fs)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "💰 Cost:\n"
-        "  Capacity locked: %llu CKB (permanent)\n"
-        "  Tx fee:          %.6f CKB\n"
-        "  Total:           %.6f CKB\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  Locked: %llu CKB (permanent)\n"
+        "  Fee:    %.6f CKB\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Round-trip: %s",
         IMAGE_FILENAME,
-        s_raw_len, s_raw_len / 1024.0f,
-        IMAGE_QUALITY, s_jpeg_len, s_jpeg_len / 1024.0f,
-        (float)s_raw_len / (s_jpeg_len > 0 ? s_jpeg_len : 1),
+        s_src_len,   s_src_len   / 1024.0f,
+        s_enc_len,   s_enc_len   / 1024.0f, IMAGE_QUALITY, ratio,
         s_tx_hash,
-        t_download_end  - t_download_start,
-        t_encode_end    - t_encode_start,
-        t_publish_end   - t_publish_start,
-        (t_confirm_end  - t_confirm_start) / 1000,
-        t_retrieve_end  - t_retrieve_start,
-        t_total, t_total / 1000.0f,
-        cost.capacity_ckb,
-        cost.fee_shannon / 1e8,
-        cost.total_shannon / 1e8,
-        match ? "PASS ✅ (bytes identical)" : "WARN ⚠️ (size mismatch)"
+        t_download_ms, t_encode_ms, t_publish_ms,
+        t_confirm_ms / 1000,
+        t_retrieve_ms, t_total / 1000, t_total / 1000.0f,
+        cost.capacity_ckb, cost.fee_shannon / 1e8,
+        match ? "PASS (bytes identical)" : "WARN (mismatch)"
     );
 
     Serial.println(report);
-    tg.println(report);
+    tg_send_text(report);
 
-    // Send the actual image to Telegram
-    send_image_to_telegram(s_chain_buf, s_chain_len,
-                           ("CKBFS round-trip: " + String(s_tx_hash)).c_str());
+    // Send the retrieved image as a photo
+    char caption[80];
+    snprintf(caption, sizeof(caption), "CKBFS image — %s", s_tx_hash);
+    tg_send_photo(s_chain_buf, s_chain_len, caption);
 
-    // Display final stats on TFT
+    // Final TFT summary
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString("COMPLETE", 4, 4);
-    tft.drawString("TX: " + String(s_tx_hash).substring(0, 22), 4, 14);
-    tft.drawString(String(s_raw_len/1024) + "KB → " + String(s_jpeg_len/1024) + "KB", 4, 24);
-    tft.drawString(String(cost.capacity_ckb) + " CKB locked", 4, 34);
-    tft.drawString("Total: " + String(t_total/1000.0f, 1) + "s", 4, 44);
-    tft.drawString(match ? "Round-trip: PASS" : "Round-trip: WARN", 4, 54);
+    tft.drawString("CKBFS TEST COMPLETE", 60, 4);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String(s_src_len/1024) + "KB -> " + String(s_enc_len/1024) + "KB (Q" + IMAGE_QUALITY + ")", 4, 20);
+    tft.drawString(String(cost.capacity_ckb) + " CKB locked forever", 4, 30);
+    tft.drawString("Total: " + String(t_total / 1000.0f, 1) + "s", 4, 40);
+    tft.drawString(match ? "Round-trip: PASS" : "Round-trip: WARN", 4, 50);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(String(s_tx_hash).substring(0, 20) + "...", 4, 60);
+
+    // Free buffers
+    free(s_src_buf);
+    free(s_enc_buf);
+    free(s_chain_buf);
 }
 
 void loop() {
-    // Nothing — one-shot test. Reset to run again.
+    // One-shot — nothing to do. Reset board to run again.
     delay(5000);
 }

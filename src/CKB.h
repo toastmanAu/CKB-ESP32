@@ -794,6 +794,20 @@ public:
 
 #endif // CKB_NODE_LIGHT
 
+    /**
+     * Send a raw send_transaction JSON-RPC body directly.
+     * Used by CKBFS and other protocols that need custom witness arrays.
+     * @param node_url    CKB node RPC URL
+     * @param json_body   Complete JSON-RPC body (method + params)
+     * @param tx_hash_out 67-char output buffer for resulting tx hash, or nullptr
+     * @return CKB_OK on success
+     */
+    static CKBError broadcastRaw(const char* node_url,
+                                  const char* json_body,
+                                  char* tx_hash_out = nullptr,
+                                  uint32_t timeoutMs = CKB_HTTP_TIMEOUT_MS);
+
+
 private:
     char _nodeUrl[128];
     char _indexerUrl[128];

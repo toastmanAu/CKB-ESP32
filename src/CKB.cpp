@@ -1611,3 +1611,31 @@ bool CKBClient::waitForSync(uint64_t targetBlock, uint32_t timeoutMs, uint32_t p
 }
 
 #endif // CKB_NODE_LIGHT
+
+// ── broadcastRaw — send custom JSON-RPC body for CKBFS etc ────────────────────
+CKBError CKBClient::broadcastRaw(const char *node_url,
+                                   const char *json_body,
+                                   char *tx_hash_out,
+                                   uint32_t timeoutMs)
+{
+    if (!node_url || !json_body) return CKB_ERR_INVALID;
+
+    static char resp[256];
+    if (!_rpcCallStatic(node_url, "send_transaction", json_body, resp, sizeof(resp), timeoutMs))
+        return CKB_ERR_HTTP;
+
+    // Extract tx hash from {"result":"0x..."}
+    const char *r = strstr(resp, "\"result\":\"0x");
+    if (!r) {
+        // Check for error
+        if (strstr(resp, "\"error\"")) return CKB_ERR_RPC;
+        return CKB_ERR_RPC;
+    }
+    r += strlen("\"result\":\"");
+    if (tx_hash_out) {
+        size_t i = 0;
+        while (r[i] && r[i] != '"' && i < 66) { tx_hash_out[i] = r[i]; i++; }
+        tx_hash_out[i] = '\0';
+    }
+    return CKB_OK;
+}
