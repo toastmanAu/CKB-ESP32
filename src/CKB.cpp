@@ -1620,21 +1620,54 @@ CKBError CKBClient::broadcastRaw(const char *node_url,
 {
     if (!node_url || !json_body) return CKB_ERR_INVALID;
 
-    static char resp[256];
-    if (!_rpcCallStatic(node_url, "send_transaction", json_body, resp, sizeof(resp), timeoutMs))
+    // Parse host and port from URL (e.g. "http://192.168.1.1:8114")
+    const char *hostStart = strstr(node_url, "://");
+    if (!hostStart) return CKB_ERR_INVALID;
+    hostStart += 3;
+    const char *portColon = strchr(hostStart, ':');
+    uint16_t port = 80;
+    char host[64] = {};
+    if (portColon) {
+        size_t hostLen = portColon - hostStart;
+        if (hostLen >= sizeof(host)) return CKB_ERR_INVALID;
+        memcpy(host, hostStart, hostLen);
+        port = (uint16_t)atoi(portColon + 1);
+    } else {
+        strncpy(host, hostStart, sizeof(host)-1);
+    }
+
+    // Explicit connect with 8s timeout — avoids indefinite hang on CYD WiFi
+    WiFiClient wifiClient;
+    unsigned long t0 = millis();
+    if (!wifiClient.connect(host, port, 8000)) {
+        Serial.printf("[broadcast] connect timeout to %s:%u (%lums)\n", host, port, millis()-t0);
         return CKB_ERR_HTTP;
+    }
+    Serial.printf("[broadcast] connected in %lums\n", millis()-t0);
+
+    HTTPClient http;
+    http.begin(wifiClient, node_url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(timeoutMs > 0 ? timeoutMs : 20000);
+    int code = http.POST((uint8_t*)json_body, strlen(json_body));
+    Serial.printf("[broadcast] HTTP %d body_len=%u\n", code, (unsigned)strlen(json_body));
+    if (code != 200) {
+        String err = http.getString();
+        Serial.printf("[broadcast] err: %s\n", err.c_str());
+        http.end(); return CKB_ERR_HTTP;
+    }
+    String resp = http.getString();
+    Serial.printf("[broadcast] resp: %.120s\n", resp.c_str());
+    http.end();
 
     // Extract tx hash from {"result":"0x..."}
-    const char *r = strstr(resp, "\"result\":\"0x");
-    if (!r) {
-        // Check for error
-        if (strstr(resp, "\"error\"")) return CKB_ERR_RPC;
-        return CKB_ERR_RPC;
-    }
-    r += strlen("\"result\":\"");
+    int idx = resp.indexOf("\"result\":\"0x");
+    if (idx < 0) return CKB_ERR_RPC;
+    idx += strlen("\"result\":\"");
     if (tx_hash_out) {
         size_t i = 0;
-        while (r[i] && r[i] != '"' && i < 66) { tx_hash_out[i] = r[i]; i++; }
+        while (idx+i < (int)resp.length() && resp[idx+i] != '"' && i < 66)
+            { tx_hash_out[i] = resp[idx+i]; i++; }
         tx_hash_out[i] = '\0';
     }
     return CKB_OK;

@@ -72,7 +72,7 @@ static inline size_t mol_write_script(CKBBuf* b, const char* codeHash, const cha
     if (argsHex[0]=='0'&&(argsHex[1]=='x'||argsHex[1]=='X')) argsHex += 2;
     size_t argsLen = strlen(argsHex) / 2;
 
-    size_t totalSize = 4 + 4*4 + 32 + 1 + (4 + argsLen);
+    size_t totalSize = 4 + 3*4 + 32 + 1 + (4 + argsLen);
     // table header: total_size(4) + offsets(4 each field = 3 fields)
     // fields: code_hash, hash_type, args
     size_t headerSize = 4 + 3*4; // 16

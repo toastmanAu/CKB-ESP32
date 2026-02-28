@@ -821,6 +821,17 @@ private:
     // Tx builder helpers
     bool _buildRawTxMolecule(CKBBuiltTx& tx);
     void _computeSigningHash(CKBBuiltTx& tx);
+
+public:
+    // Prepare a manually-built CKBBuiltTx for signing: computes rawTx bytes,
+    // txHash, and signingHash. Call this before signTx() on hand-built txs.
+    bool prepareForSigning(CKBBuiltTx& tx) {
+        if (!_buildRawTxMolecule(tx)) return false;
+        _computeSigningHash(tx);
+        return true;
+    }
+
+private:
     static void _bytesToHex(const uint8_t* bytes, size_t len, char* out);
     static bool _buildWitnessHex(const uint8_t sig65[65], char* out, size_t outCap);
     static bool _rpcCallStatic(const char* url, const char* method,

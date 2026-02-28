@@ -177,6 +177,22 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
                            char *tx_hash_out /* 67 bytes */);
 
 /**
+ * ckbfs_publish with pre-specified input cell (skips indexer lookup).
+ * Use when indexer is unavailable or to speed up the publish path.
+ */
+ckbfs_err_t ckbfs_publish_with_input(const char *node_url,
+                                      const CKBKey &key,
+                                      const uint8_t *content,
+                                      size_t content_len,
+                                      const char *filename,
+                                      const char *content_type,
+                                      uint64_t capacity_ckb,
+                                      const char *input_tx_hash,
+                                      uint32_t input_index,
+                                      uint64_t input_capacity_shannon,
+                                      char *tx_hash_out /* 67 bytes */);
+
+/**
  * Build just the witness bytes for a CKBFS publish.
  * Useful for manual tx building or testing without a live node.
  *

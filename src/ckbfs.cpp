@@ -14,6 +14,7 @@
 #include "ckbfs.h"
 #include "CKB.h"
 #include "CKBSigner.h"
+#include "ckb_blake2b.h"
 #include <HTTPClient.h>
 #ifdef ARDUINO
   #include <esp_task_wdt.h>
@@ -237,6 +238,7 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
 
     // ── 3. Collect input cells ────────────────────────────────────
     CKBClient ckb(node_url);
+    ckb.setTimeoutMs(8000);  // 8s max per RPC call
     CKBScript lock_script = {};
     strncpy(lock_script.codeHash, SECP_CODE_HASH, sizeof(lock_script.codeHash));
     strncpy(lock_script.hashType, SECP_HASH_TYPE, sizeof(lock_script.hashType));
@@ -244,6 +246,7 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
 
     uint64_t cap_shannon = capacity_ckb * 100000000ULL;
     uint64_t fee_shannon = (uint64_t)(wit_len + 1000);
+    Serial.printf("[CKBFS] collectInputCells, need %llu shannon\n", cap_shannon + fee_shannon);
 
     CKBTxInput inputs[CKB_TX_MAX_INPUTS] = {};
     uint8_t input_count = 0;
@@ -253,6 +256,7 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
                                            inputs, input_count, total_input);
     if (cerr != CKB_OK) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
     if (total_input < cap_shannon + fee_shannon) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
+    Serial.printf("[CKBFS] got %u inputs, total %llu shannon\n", input_count, total_input);
 
     // ── 4. Build CKBFS index cell data ────────────────────────────
     ckbfs_meta_t meta = {};
@@ -301,6 +305,7 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
 
     // ── 6. Sign ───────────────────────────────────────────────────
     CKBError serr = CKBClient::signTx(tx, key);
+    Serial.printf("[CKBFS] signTx: %d\n", (int)serr);
     if (serr != CKB_OK) { free(wit_buf); return CKBFS_ERR_SIGN; }
 
     // ── 7. Build witness hex strings ──────────────────────────────
@@ -389,6 +394,189 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
 
     // ── 9. Broadcast ──────────────────────────────────────────────
     CKBError berr = CKBClient::broadcastRaw(node_url, body, tx_hash_out);
+    Serial.printf("[CKBFS] broadcastRaw: %d\n", (int)berr);
+    free(body);
+    return (berr == CKB_OK) ? CKBFS_OK : CKBFS_ERR_BROADCAST;
+}
+
+// ── Write: publish with pre-specified input cell (no indexer needed) ─
+ckbfs_err_t ckbfs_publish_with_input(const char *node_url,
+                                      const CKBKey &key,
+                                      const uint8_t *content,
+                                      size_t content_len,
+                                      const char *filename,
+                                      const char *content_type,
+                                      uint64_t capacity_ckb,
+                                      const char *input_tx_hash,
+                                      uint32_t input_index,
+                                      uint64_t input_capacity_shannon,
+                                      char *tx_hash_out)
+{
+    if (content_len > CKBFS_MAX_CONTENT) return CKBFS_ERR_TOO_LARGE;
+
+    size_t wit_buf_len = CKBFS_HEADER_LEN + content_len;
+    uint8_t *wit_buf = (uint8_t *)malloc(wit_buf_len);
+    if (!wit_buf) return CKBFS_ERR_NO_MEM;
+    uint32_t checksum = 0;
+    size_t wit_len = ckbfs_build_witness(content, content_len, wit_buf, wit_buf_len, &checksum);
+    if (!wit_len) { free(wit_buf); return CKBFS_ERR_NO_MEM; }
+
+    char lock_args[43] = {};
+    if (!key.getLockArgsHex(lock_args, sizeof(lock_args))) {
+        free(wit_buf); return CKBFS_ERR_SIGN;
+    }
+
+    uint64_t cap_shannon  = capacity_ckb * 100000000ULL;
+    uint64_t fee_shannon  = (uint64_t)(wit_len + 1000);
+    uint64_t total_input  = input_capacity_shannon;
+
+    Serial.printf("[CKBFS] using pre-specified input: %s[%u] = %llu shannon\n",
+                  input_tx_hash, input_index, total_input);
+
+    if (total_input < cap_shannon + fee_shannon) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
+
+    ckbfs_meta_t meta = {};
+    strncpy(meta.filename, filename, sizeof(meta.filename)-1);
+    strncpy(meta.content_type, content_type, sizeof(meta.content_type)-1);
+    meta.checksum     = checksum;
+    meta.indexes[0]   = 1;
+    meta.index_count  = 1;
+    meta.has_backlinks = false;
+    uint8_t cell_data[256] = {};
+    size_t cell_data_len = ckbfs_build_cell_data(&meta, cell_data, sizeof(cell_data));
+
+    CKBBuiltTx *txp = (CKBBuiltTx*)calloc(1, sizeof(CKBBuiltTx));
+    if (!txp) { free(wit_buf); return CKBFS_ERR_NO_MEM; }
+    CKBBuiltTx& tx = *txp;
+    tx.valid = true;
+
+    strncpy(tx.cellDeps[0].txHash, SECP_DEP_TX, sizeof(tx.cellDeps[0].txHash));
+    tx.cellDeps[0].index      = 0;
+    tx.cellDeps[0].isDepGroup = true;
+    tx.cellDepCount = 1;
+
+    // Single pre-specified input
+    strncpy(tx.inputs[0].txHash, input_tx_hash, sizeof(tx.inputs[0].txHash));
+    tx.inputs[0].index = input_index;
+    tx.inputCount = 1;
+
+    uint64_t change = total_input - cap_shannon - fee_shannon;
+    strncpy(tx.outputs[0].lockScript.codeHash, SECP_CODE_HASH, sizeof(tx.outputs[0].lockScript.codeHash));
+    strncpy(tx.outputs[0].lockScript.hashType, SECP_HASH_TYPE, sizeof(tx.outputs[0].lockScript.hashType));
+    strncpy(tx.outputs[0].lockScript.args, lock_args, sizeof(tx.outputs[0].lockScript.args));
+    tx.outputs[0].capacity = change;
+
+    strncpy(tx.outputs[1].lockScript.codeHash, SECP_CODE_HASH, sizeof(tx.outputs[1].lockScript.codeHash));
+    strncpy(tx.outputs[1].lockScript.hashType, SECP_HASH_TYPE, sizeof(tx.outputs[1].lockScript.hashType));
+    strncpy(tx.outputs[1].lockScript.args, lock_args, sizeof(tx.outputs[1].lockScript.args));
+    tx.outputs[1].capacity = cap_shannon;
+    tx.outputCount = 2;
+
+    // Compute txHash + signingHash
+    // RFC 0017: signing_message = blake2b(tx_hash || len(w0) || w0 || len(w1) || w1)
+    // witnesses[0] = WitnessArgs placeholder (secp256k1 lock)
+    // witnesses[1] = CKBFS content witness (remaining witness in same group)
+    // BOTH must be included in the signing hash — verified working on-chain.
+    CKBClient ckb_signer(node_url);
+    if (!ckb_signer.prepareForSigning(tx)) {
+        free(wit_buf); free(txp); return CKBFS_ERR_SIGN;
+    }
+    Serial.printf("[CKBFS] txHash: %.16s...\n", tx.txHashHex);
+
+    // Rebuild signing hash including the CKBFS witness (wit_buf)
+    {
+        // WitnessArgs placeholder (witnesses[0]) — 65 zero bytes in lock field
+        uint8_t wa_placeholder[CKB_WITNESS_ARGS_LEN] = {};
+        CKBSigner::buildWitnessPlaceholder(wa_placeholder);
+
+        CKB_Blake2b ctx;
+        ckb_blake2b_init(&ctx);
+        ckb_blake2b_update(&ctx, tx.txHash, 32);
+        // witnesses[0]: WitnessArgs placeholder
+        uint64_t w0len = CKB_WITNESS_ARGS_LEN;
+        uint8_t w0lenbuf[8]; for(int i=0;i<8;i++) w0lenbuf[i]=(uint8_t)(w0len>>(i*8));
+        ckb_blake2b_update(&ctx, w0lenbuf, 8);
+        ckb_blake2b_update(&ctx, wa_placeholder, CKB_WITNESS_ARGS_LEN);
+        // witnesses[1]: CKBFS content witness (remaining witness — must be included per RFC 0017)
+        uint64_t w1len = wit_len;
+        uint8_t w1lenbuf[8]; for(int i=0;i<8;i++) w1lenbuf[i]=(uint8_t)(w1len>>(i*8));
+        ckb_blake2b_update(&ctx, w1lenbuf, 8);
+        ckb_blake2b_update(&ctx, wit_buf, wit_len);
+        ckb_blake2b_final(&ctx, tx.signingHash);
+        Serial.printf("[CKBFS] sigHash: %02x%02x%02x%02x...\n",
+                      tx.signingHash[0], tx.signingHash[1],
+                      tx.signingHash[2], tx.signingHash[3]);
+    }
+
+    CKBError serr = CKBClient::signTx(tx, key);
+    Serial.printf("[CKBFS] signTx: %d\n", (int)serr);
+    if (serr != CKB_OK) { free(wit_buf); free(txp); return CKBFS_ERR_SIGN; }
+
+    uint8_t wa[CKB_WITNESS_ARGS_LEN] = {};
+    CKBSigner::buildWitnessWithSig(tx.signature, wa);
+    free(txp); txp = nullptr;  // done with tx struct
+    CKBSigner::buildWitnessWithSig(tx.signature, wa);
+    char *wa_hex = (char *)malloc(2 + CKB_WITNESS_ARGS_LEN*2 + 1);
+    if (!wa_hex) { free(wit_buf); return CKBFS_ERR_NO_MEM; }
+    wa_hex[0]='0'; wa_hex[1]='x';
+    bytes_to_hex(wa, CKB_WITNESS_ARGS_LEN, wa_hex+2);
+
+    char *ckbfs_hex = (char *)malloc(2 + wit_len*2 + 1);
+    if (!ckbfs_hex) { free(wit_buf); free(wa_hex); return CKBFS_ERR_NO_MEM; }
+    ckbfs_hex[0]='0'; ckbfs_hex[1]='x';
+    bytes_to_hex(wit_buf, wit_len, ckbfs_hex+2);
+    free(wit_buf); wit_buf = nullptr;
+
+    char *cdata_hex = (char *)malloc(2 + cell_data_len*2 + 1);
+    if (!cdata_hex) { free(wa_hex); free(ckbfs_hex); return CKBFS_ERR_NO_MEM; }
+    cdata_hex[0]='0'; cdata_hex[1]='x';
+    bytes_to_hex(cell_data, cell_data_len, cdata_hex+2);
+
+    char *inputs_json = (char *)malloc(256);
+    if (!inputs_json) { free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
+    snprintf(inputs_json, 256,
+        "[{\"previous_output\":{\"tx_hash\":\"%s\",\"index\":\"0x%x\"},\"since\":\"0x0\"}]",
+        input_tx_hash, input_index);
+
+    char change_hex[20], cap_hex[20];
+    snprintf(change_hex, sizeof(change_hex), "0x%" PRIx64, change);
+    snprintf(cap_hex, sizeof(cap_hex), "0x%" PRIx64, cap_shannon);
+
+    char *outputs_json = (char *)malloc(512);
+    if (!outputs_json) { free(inputs_json); free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
+    snprintf(outputs_json, 512,
+        "[{\"capacity\":\"%s\",\"lock\":{\"code_hash\":\"%s\",\"hash_type\":\"%s\",\"args\":\"%s\"},\"type\":null},"
+         "{\"capacity\":\"%s\",\"lock\":{\"code_hash\":\"%s\",\"hash_type\":\"%s\",\"args\":\"%s\"},\"type\":null}]",
+        change_hex, SECP_CODE_HASH, SECP_HASH_TYPE, lock_args,
+        cap_hex, SECP_CODE_HASH, SECP_HASH_TYPE, lock_args);
+
+    char *deps_json = (char *)malloc(220);
+    if (!deps_json) { free(outputs_json); free(inputs_json); free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
+    snprintf(deps_json, 220,
+        "[{\"out_point\":{\"tx_hash\":\"%s\",\"index\":\"0x0\"},\"dep_type\":\"dep_group\"}]",
+        SECP_DEP_TX);
+
+    size_t body_size = strlen(inputs_json) + strlen(outputs_json) + strlen(deps_json)
+                     + 2 + CKB_WITNESS_ARGS_LEN*2 + 2 + wit_len*2 + 2 + cell_data_len*2 + 512;
+    char *body = (char *)malloc(body_size);
+    if (!body) { free(deps_json); free(outputs_json); free(inputs_json); free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
+
+    snprintf(body, body_size,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"send_transaction\","
+        "\"params\":[{\"version\":\"0x0\","
+        "\"cell_deps\":%s,\"header_deps\":[],"
+        "\"inputs\":%s,\"outputs\":%s,"
+        "\"outputs_data\":[\"0x\",\"0x\"],"
+        "\"witnesses\":[\"%s\",\"%s\"]"
+        "},\"passthrough\"],\"id\":1}",
+        deps_json, inputs_json, outputs_json, wa_hex, ckbfs_hex);
+
+    free(deps_json); free(outputs_json); free(inputs_json);
+    free(wa_hex); free(ckbfs_hex); free(cdata_hex);
+
+    Serial.printf("[CKBFS] body size: %u\n", (unsigned)strlen(body));
+    CKBError berr = CKBClient::broadcastRaw(node_url, body, tx_hash_out);
+    Serial.printf("[CKBFS] broadcastRaw: %d\n", (int)berr);
     free(body);
     return (berr == CKB_OK) ? CKBFS_OK : CKBFS_ERR_BROADCAST;
 }
