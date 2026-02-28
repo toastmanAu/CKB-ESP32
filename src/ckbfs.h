@@ -246,6 +246,14 @@ typedef struct {
 /**
  * Estimate the CKB capacity and fee required to store data via CKBFS.
  *
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │  COMPRESS BEFORE YOU PUBLISH                                │
+ * │  Capacity is FLAT — set by cell structure, not content.     │
+ * │  Content lives in the witness (zero capacity cost).         │
+ * │  Only the tx FEE scales with bytes — so compress hard.      │
+ * │  Storing 1KB vs 500KB costs the same locked CKB.            │
+ * └─────────────────────────────────────────────────────────────┘
+ *
  * Capacity breakdown (all in bytes = CKB):
  *   Base cell:    8 (capacity) + 32 (lock code_hash) + 1 (hash_type) + 20 (lock args) = 61
  *   Type script:  32 + 1 + 32 = 65  (only if use_type_script = true)
