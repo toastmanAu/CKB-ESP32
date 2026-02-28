@@ -1,54 +1,85 @@
-#include <HTTPClient.h>
 /*
  * ckbfs.cpp — CKBFS Protocol implementation for CKB-ESP32
- * Spec: code-monad/ckbfs RFC.md (Witnesses-based content storage)
+ * =========================================================
+ * Content lives in tx witnesses (not cell data).
+ * Index cell holds molecule-encoded metadata.
  *
- * Key design: content goes in witnesses, index metadata in cell data.
- * Transaction witnesses layout:
- *   [0] WitnessArgs with 65-byte signing placeholder → replaced with sig after sign
- *   [1] "CKBFS\x00" + content bytes
+ * Tx layout:
+ *   witnesses[0]: WitnessArgs (65-byte sig placeholder → real sig after sign)
+ *   witnesses[1]: "CKBFS\x00" + content bytes
+ *   outputs[0]:   change back to sender
+ *   outputs[1]:   CKBFS index cell (locked forever, molecule metadata)
  */
 
 #include "ckbfs.h"
 #include "CKB.h"
 #include "CKBSigner.h"
+#include <HTTPClient.h>
+#ifdef ARDUINO
+  #include <esp_task_wdt.h>
+  #define WDT_FEED() esp_task_wdt_reset()
+#else
+  #define WDT_FEED() do {} while(0)
+#endif
 
 // ── Molecule helpers ──────────────────────────────────────────────
 static size_t mol_u32le(uint8_t *out, uint32_t v) {
-    out[0]=v; out[1]=v>>8; out[2]=v>>16; out[3]=v>>24; return 4;
+    out[0]=(uint8_t)v; out[1]=(uint8_t)(v>>8);
+    out[2]=(uint8_t)(v>>16); out[3]=(uint8_t)(v>>24);
+    return 4;
 }
-static size_t mol_bytes(uint8_t *out, const uint8_t *data, size_t len) {
+static size_t mol_bytes_field(uint8_t *out, const uint8_t *data, size_t len) {
     mol_u32le(out, (uint32_t)len);
     if (data && len) memcpy(out+4, data, len);
     return 4 + len;
 }
-static size_t mol_indexes(uint8_t *out, const uint32_t *idxs, uint8_t n) {
+static size_t mol_indexes_vec(uint8_t *out, const uint32_t *idxs, uint8_t n) {
     uint32_t total = 4 + 4 + n*4;
     mol_u32le(out, total); mol_u32le(out+4, n);
-    for (int i=0;i<n;i++) mol_u32le(out+8+i*4, idxs[i]);
+    for (int i=0; i<n; i++) mol_u32le(out+8+i*4, idxs[i]);
     return total;
 }
 
 // ── Hex utilities ─────────────────────────────────────────────────
+static const char CKBFS_HEX[] = "0123456789abcdef";
 static void bytes_to_hex(const uint8_t *b, size_t n, char *out) {
-    static const char *h = "0123456789abcdef";
-    for (size_t i=0;i<n;i++) { out[i*2]=h[b[i]>>4]; out[i*2+1]=h[b[i]&0xf]; }
-    out[n*2]='\0';
+    for (size_t i=0; i<n; i++) {
+        out[i*2]   = CKBFS_HEX[b[i]>>4];
+        out[i*2+1] = CKBFS_HEX[b[i]&0xf];
+        if ((i & 0xFF) == 0) {
+            WDT_FEED();
+            #ifdef ARDUINO
+              vTaskDelay(1);  // yield to RTOS — resets interrupt WDT too
+            #endif
+        }
+    }
+    out[n*2] = '\0';
 }
 static uint8_t hex_nibble(char c) {
-    if(c>='0'&&c<='9') return c-'0';
-    if(c>='a'&&c<='f') return c-'a'+10;
-    if(c>='A'&&c<='F') return c-'A'+10;
+    if (c>='0' && c<='9') return c-'0';
+    if (c>='a' && c<='f') return c-'a'+10;
+    if (c>='A' && c<='F') return c-'A'+10;
     return 0;
 }
 
 // ── CKB secp256k1 lock (mainnet) ──────────────────────────────────
-static const char SECP256K1_CODE_HASH[] =
+static const char SECP_CODE_HASH[] =
     "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8";
-static const char SECP256K1_HASH_TYPE[] = "type";
+static const char SECP_HASH_TYPE[] = "type";
+static const char SECP_DEP_TX[] =
+    "0x71a7ba8fc96349fea0ed3a5c47992e3b4084b031a42264a018e0072e8172e46c";
 
-// ── Bech32m (same as CKBSigner, duplicated here to avoid C++ linkage issues) ─
-// (reuses CKBSigner::blake160 and getLockArgsHex from CKBKey)
+// ── Raw RPC helper (returns heap-alloc String, caller must check empty) ────────
+static String rpc_post(const char *url, const char *body) {
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(10000);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST((uint8_t*)body, strlen(body));
+    String resp = (code == 200) ? http.getString() : String();
+    http.end();
+    return resp;
+}
 
 // ── Build CKBFS witness bytes ─────────────────────────────────────
 size_t ckbfs_build_witness(const uint8_t *content, size_t content_len,
@@ -67,27 +98,27 @@ size_t ckbfs_build_witness(const uint8_t *content, size_t content_len,
 size_t ckbfs_build_cell_data(const ckbfs_meta_t *meta,
                               uint8_t *out, size_t out_size)
 {
+    // Build fields into temp buffer first to get sizes
     uint8_t tmp[512]; size_t pos = 0;
-
-    // field 0: indexes (Vec<Uint32>)
-    size_t f0 = mol_indexes(tmp+pos, meta->indexes, meta->index_count); pos += f0;
-    // field 1: checksum (Uint32)
+    size_t f0 = mol_indexes_vec(tmp+pos, meta->indexes, meta->index_count); pos += f0;
     size_t f1 = mol_u32le(tmp+pos, meta->checksum); pos += f1;
-    // field 2: content_type (Bytes)
-    size_t f2 = mol_bytes(tmp+pos,(const uint8_t*)meta->content_type,strlen(meta->content_type)); pos += f2;
-    // field 3: filename (Bytes)
-    size_t f3 = mol_bytes(tmp+pos,(const uint8_t*)meta->filename,strlen(meta->filename)); pos += f3;
-    // field 4: backlinks — empty Vec
-    uint32_t ev=8, ec=0;
-    memcpy(tmp+pos,&ev,4); memcpy(tmp+pos+4,&ec,4); pos += 8;
+    size_t f2 = mol_bytes_field(tmp+pos,
+                    (const uint8_t*)meta->content_type,
+                    strlen(meta->content_type)); pos += f2;
+    size_t f3 = mol_bytes_field(tmp+pos,
+                    (const uint8_t*)meta->filename,
+                    strlen(meta->filename)); pos += f3;
+    // backlinks — empty Vec<bytes>: total_size=8, count=0
+    uint8_t ev[8]; uint32_t ev32=8, ec=0;
+    memcpy(ev,&ev32,4); memcpy(ev+4,&ec,4);
+    memcpy(tmp+pos, ev, 8); pos += 8;
 
-    uint32_t header_size = 4 + 5*4;   // total_size + 5 field offsets
+    uint32_t header_size = 4 + 5*4;  // total_size field + 5 offsets
     uint32_t total_size  = header_size + (uint32_t)pos;
     if (total_size > out_size) return 0;
 
     size_t wp = 0;
     memcpy(out+wp, &total_size, 4); wp += 4;
-    // Field offsets (relative to start of table)
     uint32_t offsets[5] = {
         header_size,
         header_size + (uint32_t)f0,
@@ -95,12 +126,12 @@ size_t ckbfs_build_cell_data(const ckbfs_meta_t *meta,
         header_size + (uint32_t)(f0+f1+f2),
         header_size + (uint32_t)(f0+f1+f2+f3),
     };
-    for (int i=0;i<5;i++) { memcpy(out+wp, &offsets[i], 4); wp += 4; }
+    for (int i=0; i<5; i++) { memcpy(out+wp, &offsets[i], 4); wp += 4; }
     memcpy(out+wp, tmp, pos); wp += pos;
     return wp;
 }
 
-// ── Read ──────────────────────────────────────────────────────────
+// ── Read: fetch raw witness bytes ────────────────────────────────
 ckbfs_err_t ckbfs_fetch_witness(const char *node_url,
                                 const char *tx_hash,
                                 uint32_t    wit_index,
@@ -108,82 +139,49 @@ ckbfs_err_t ckbfs_fetch_witness(const char *node_url,
                                 size_t      buf_size,
                                 size_t     *out_len)
 {
-    // Make a direct get_transaction RPC call — CKBTransaction struct
-    // doesn't include witnesses, so we parse the raw JSON response.
-    static char s_body[160];
-    static char s_raw[CKBFS_HEADER_LEN * 2 + 200 * 1024 + 512]; // large: full tx JSON
-    snprintf(s_body, sizeof(s_body),
-        "{"jsonrpc":"2.0","method":"get_transaction","
-        ""params":[\"%s\"],"id":1}", tx_hash);
-
-    // broadcastRaw doesn't fit here — use a GET-style helper.
-    // We need a raw HTTP POST and response. Use HTTPClient directly.
-    // CKBClient exposes broadcastRaw (POST) but for read we need similar.
-    // Workaround: broadcastRaw accepts any method body, call get_transaction same way.
-    // Use the same static helper via a local CKBClient instance.
-    CKBClient ckb;
-    ckb.setNodeUrl(node_url);
-
-    // Call get_transaction via raw RPC (CKBClient::broadcastRaw works for any method)
-    snprintf(s_body, sizeof(s_body),
-        "{"jsonrpc":"2.0","method":"get_transaction","
-        ""params":["%s"],"id":1}", tx_hash);
-
-    // We need a raw RPC POST — use HTTPClient directly since CKBClient
-    // doesn't expose a generic raw-response call publicly.
-    // For now: parse witnesses from the raw response after a local HTTP call.
-    // This is included via HTTPClient.h (pulled in by CKB.h -> esp_http_client).
-
-    // Use a stripped-down HTTP POST to get full JSON response
-    HTTPClient http;
-    http.begin(node_url);
-    http.setTimeout(8000);
-    http.addHeader("Content-Type", "application/json");
+    // Build get_transaction RPC body
     char body[160];
     snprintf(body, sizeof(body),
-        "{"jsonrpc":"2.0","method":"get_transaction","
-        ""params":["%s"],"id":1}", tx_hash);
-    int code = http.POST(body);
-    if (code != 200) { http.end(); return CKBFS_ERR_RPC; }
-    String resp = http.getString();
-    http.end();
+        "{\"jsonrpc\":\"2.0\",\"method\":\"get_transaction\","
+        "\"params\":[\"%s\"],\"id\":1}", tx_hash);
 
-    const char *p = strstr(resp.c_str(), ""witnesses":[");
-    if (!p) return CKBFS_ERR_NOT_FOUND;
-    p += strlen(""witnesses":[");
+    String resp = rpc_post(node_url, body);
+    if (resp.isEmpty()) return CKBFS_ERR_RPC;
 
-    // Skip past '['
-    while (*p && *p != '[') p++;
-    if (*p == '[') p++;
+    // Find witnesses array
+    int wi = resp.indexOf("\"witnesses\":[");
+    if (wi < 0) return CKBFS_ERR_NOT_FOUND;
+    const char *p = resp.c_str() + wi + strlen("\"witnesses\":[");
 
+    // Skip to wit_index-th element
     uint32_t idx = 0;
     while (*p) {
-        // Skip whitespace/comma
-        while (*p == ' ' || *p == ',' || *p == '\n') p++;
+        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r') p++;
         if (*p == ']') break;
         if (*p != '"') { p++; continue; }
         p++;  // skip opening quote
 
         if (idx == wit_index) {
-            // This is our witness hex string
-            if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) p += 2;
-            // Decode hex
-            size_t tlen = 0;
-            static uint8_t tmp[CKBFS_HEADER_LEN + 200 * 1024];
-            while (p[0] && p[1] && p[0] != '"' && tlen < sizeof(tmp)) {
-                tmp[tlen++] = (hex_nibble(p[0])<<4) | hex_nibble(p[1]);
+            // Decode hex witness: skip "0x" prefix
+            if (p[0]=='0' && (p[1]=='x' || p[1]=='X')) p += 2;
+            // Skip CKBFS header (6 bytes = 12 hex chars)
+            if (strlen(p) < CKBFS_HEADER_LEN*2) return CKBFS_ERR_BAD_MAGIC;
+            // Check magic
+            char magic_hex[12]; memcpy(magic_hex, p, 10); magic_hex[10]=0;
+            // "CKBFS\x00" hex = "434b424653" + "00"
+            if (strncmp(p, "434b42465300", 12) != 0) return CKBFS_ERR_BAD_MAGIC;
+            p += CKBFS_HEADER_LEN * 2;
+            // Decode content bytes
+            size_t bytes = 0;
+            while (*p && *p != '"' && bytes < buf_size) {
+                if (p[1] == '\0' || p[1] == '"') break;
+                buf[bytes++] = (hex_nibble(p[0]) << 4) | hex_nibble(p[1]);
                 p += 2;
             }
-            if (tlen < CKBFS_HEADER_LEN) return CKBFS_ERR_NOT_FOUND;
-            if (memcmp(tmp, CKBFS_MAGIC, CKBFS_MAGIC_LEN) != 0) return CKBFS_ERR_BAD_MAGIC;
-            if (tmp[CKBFS_MAGIC_LEN] != CKBFS_VERSION) return CKBFS_ERR_BAD_MAGIC;
-            size_t clen = tlen - CKBFS_HEADER_LEN;
-            if (clen > buf_size) return CKBFS_ERR_TOO_LARGE;
-            memcpy(buf, tmp + CKBFS_HEADER_LEN, clen);
-            *out_len = clen;
+            if (out_len) *out_len = bytes;
             return CKBFS_OK;
         }
-        // Skip this witness string
+        // Skip past this witness string
         while (*p && *p != '"') p++;
         if (*p == '"') p++;
         idx++;
@@ -191,6 +189,7 @@ ckbfs_err_t ckbfs_fetch_witness(const char *node_url,
     return CKBFS_ERR_NOT_FOUND;
 }
 
+// ── Read: high-level with checksum verify ─────────────────────────
 ckbfs_err_t ckbfs_read(const char *node_url,
                        const char *tx_hash,
                        uint32_t    wit_index,
@@ -199,20 +198,17 @@ ckbfs_err_t ckbfs_read(const char *node_url,
                        size_t      buf_size,
                        size_t     *out_len)
 {
+    size_t len = 0;
     ckbfs_err_t e = ckbfs_fetch_witness(node_url, tx_hash, wit_index,
-                                        buf, buf_size, out_len);
+                                         buf, buf_size, &len);
     if (e != CKBFS_OK) return e;
-    if (expected_checksum && !ckbfs_verify(buf, *out_len, expected_checksum))
+    if (expected_checksum && !ckbfs_verify(buf, len, expected_checksum))
         return CKBFS_ERR_CHECKSUM;
+    if (out_len) *out_len = len;
     return CKBFS_OK;
 }
 
-// ── Publish ───────────────────────────────────────────────────────
-// Broadcasts a tx with TWO witnesses:
-//   witnesses[0] = WitnessArgs (signing placeholder, replaced with sig)
-//   witnesses[1] = CKBFS content bytes
-// Uses a custom RPC call since broadcastWithWitness() only supports one witness.
-
+// ── Write: publish a CKBFS file ───────────────────────────────────
 ckbfs_err_t ckbfs_publish(const char *node_url,
                            const CKBKey &key,
                            const uint8_t *content,
@@ -224,58 +220,58 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
 {
     if (content_len > CKBFS_MAX_CONTENT) return CKBFS_ERR_TOO_LARGE;
 
-    // 1. Build CKBFS witness bytes
-    static uint8_t s_wit_buf[CKBFS_HEADER_LEN + CKBFS_MAX_CONTENT];
+    // ── 1. Build CKBFS witness ────────────────────────────────────
+    size_t wit_buf_len = CKBFS_HEADER_LEN + content_len;
+    uint8_t *wit_buf = (uint8_t *)malloc(wit_buf_len);
+    if (!wit_buf) return CKBFS_ERR_NO_MEM;
     uint32_t checksum = 0;
     size_t wit_len = ckbfs_build_witness(content, content_len,
-                                          s_wit_buf, sizeof(s_wit_buf), &checksum);
-    if (!wit_len) return CKBFS_ERR_NO_MEM;
+                                          wit_buf, wit_buf_len, &checksum);
+    if (!wit_len) { free(wit_buf); return CKBFS_ERR_NO_MEM; }
 
-    // 2. Get lock args from key
-    char lock_args[43];
-    if (!key.getLockArgsHex(lock_args, sizeof(lock_args))) return CKBFS_ERR_NO_MEM;
+    // ── 2. Get lock args from key ─────────────────────────────────
+    char lock_args[43] = {};
+    if (!key.getLockArgsHex(lock_args, sizeof(lock_args))) {
+        free(wit_buf); return CKBFS_ERR_SIGN;
+    }
 
-    // 3. Collect input cells
-    CKBClient ckb;
-    ckb.setNodeUrl(node_url);
-
-    CKBScript lock_script;
-    strncpy(lock_script.codeHash, SECP256K1_CODE_HASH, sizeof(lock_script.codeHash));
-    strncpy(lock_script.hashType, SECP256K1_HASH_TYPE, sizeof(lock_script.hashType));
+    // ── 3. Collect input cells ────────────────────────────────────
+    CKBClient ckb(node_url);
+    CKBScript lock_script = {};
+    strncpy(lock_script.codeHash, SECP_CODE_HASH, sizeof(lock_script.codeHash));
+    strncpy(lock_script.hashType, SECP_HASH_TYPE, sizeof(lock_script.hashType));
     strncpy(lock_script.args, lock_args, sizeof(lock_script.args));
 
-    uint64_t capacity_shannon = capacity_ckb * 100000000ULL;
-    uint64_t fee_shannon = (uint64_t)(wit_len + 1000);  // rough fee estimate
+    uint64_t cap_shannon = capacity_ckb * 100000000ULL;
+    uint64_t fee_shannon = (uint64_t)(wit_len + 1000);
 
-    CKBTxInput inputs[CKB_TX_MAX_INPUTS];
-    uint8_t    input_count = 0;
-    uint64_t   total_input = 0;
-
+    CKBTxInput inputs[CKB_TX_MAX_INPUTS] = {};
+    uint8_t input_count = 0;
+    uint64_t total_input = 0;
     CKBError cerr = ckb.collectInputCells(lock_script,
-                                           capacity_shannon + fee_shannon,
+                                           cap_shannon + fee_shannon,
                                            inputs, input_count, total_input);
-    if (cerr != CKB_OK) return CKBFS_ERR_CAPACITY;
+    if (cerr != CKB_OK) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
+    if (total_input < cap_shannon + fee_shannon) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
 
-    // 4. Build outputs
-    // Output 0: change back to sender
-    uint64_t change = total_input - capacity_shannon - fee_shannon;
-    if (total_input < capacity_shannon + fee_shannon) return CKBFS_ERR_CAPACITY;
+    // ── 4. Build CKBFS index cell data ────────────────────────────
+    ckbfs_meta_t meta = {};
+    strncpy(meta.filename, filename, sizeof(meta.filename)-1);
+    strncpy(meta.content_type, content_type, sizeof(meta.content_type)-1);
+    meta.checksum     = checksum;
+    meta.indexes[0]   = 1;  // witness index 1 = CKBFS content witness
+    meta.index_count  = 1;
+    meta.has_backlinks = false;
+    uint8_t cell_data[256] = {};
+    size_t cell_data_len = ckbfs_build_cell_data(&meta, cell_data, sizeof(cell_data));
 
-    // 5. Compute signing hash (standard WitnessArgs approach)
-    // signing_hash = blake2b_ckb(tx_hash_placeholder + witness[0] length + witness[0] placeholder)
-    // We need the tx hash first, which requires building the raw tx molecule.
-    // Use CKBSigner::computeSigningHash after getting tx_hash from the node dry-run.
-    //
-    // Simplified approach: use buildTransfer skeleton + sign + custom broadcast
-    // Build a minimal CKBBuiltTx manually
+    // ── 5. Build CKBBuiltTx ───────────────────────────────────────
     CKBBuiltTx tx = {};
     tx.valid = true;
 
-    // Cell deps: secp256k1 dep group (mainnet)
-    strncpy(tx.cellDeps[0].txHash,
-            "0x71a7ba8fc96349fea0ed3a5c47992e3b4084b031a42264a018e0072e8172e46c",
-            sizeof(tx.cellDeps[0].txHash));
-    tx.cellDeps[0].index = 0;
+    // Cell dep: secp256k1 dep group
+    strncpy(tx.cellDeps[0].txHash, SECP_DEP_TX, sizeof(tx.cellDeps[0].txHash));
+    tx.cellDeps[0].index      = 0;
     tx.cellDeps[0].isDepGroup = true;
     tx.cellDepCount = 1;
 
@@ -283,67 +279,97 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
     for (uint8_t i = 0; i < input_count; i++) tx.inputs[i] = inputs[i];
     tx.inputCount = input_count;
 
-    // Output: change only (CKBFS cell is implicit in the witness — no type script version)
-    strncpy(tx.outputs[0].lockScript.codeHash, SECP256K1_CODE_HASH,
+    // Output 0: change back to sender
+    uint64_t change = total_input - cap_shannon - fee_shannon;
+    strncpy(tx.outputs[0].lockScript.codeHash, SECP_CODE_HASH,
             sizeof(tx.outputs[0].lockScript.codeHash));
-    strncpy(tx.outputs[0].lockScript.hashType, SECP256K1_HASH_TYPE,
+    strncpy(tx.outputs[0].lockScript.hashType, SECP_HASH_TYPE,
             sizeof(tx.outputs[0].lockScript.hashType));
     strncpy(tx.outputs[0].lockScript.args, lock_args,
             sizeof(tx.outputs[0].lockScript.args));
     tx.outputs[0].capacity = change;
-    tx.outputCount = 1;
-    tx.totalInputCapacity  = total_input;
-    tx.totalOutputCapacity = change;
 
-    // 6. Sign — CKBSigner computes tx hash internally and returns signing hash
-    if (!CKBSigner::signTx(tx, key)) return CKBFS_ERR_SIGN;
+    // Output 1: CKBFS index cell (locked to sender, permanent)
+    strncpy(tx.outputs[1].lockScript.codeHash, SECP_CODE_HASH,
+            sizeof(tx.outputs[1].lockScript.codeHash));
+    strncpy(tx.outputs[1].lockScript.hashType, SECP_HASH_TYPE,
+            sizeof(tx.outputs[1].lockScript.hashType));
+    strncpy(tx.outputs[1].lockScript.args, lock_args,
+            sizeof(tx.outputs[1].lockScript.args));
+    tx.outputs[1].capacity = cap_shannon;
+    tx.outputCount = 2;
 
-    // 7. Build CKBFS witness hex string ("0x" + hex of s_wit_buf)
-    static char s_ckbfs_wit_hex[2 + CKBFS_HEADER_LEN*2 + CKBFS_MAX_CONTENT*2 + 2];
-    s_ckbfs_wit_hex[0] = '0'; s_ckbfs_wit_hex[1] = 'x';
-    bytes_to_hex(s_wit_buf, wit_len, s_ckbfs_wit_hex + 2);
+    // ── 6. Sign ───────────────────────────────────────────────────
+    CKBError serr = CKBClient::signTx(tx, key);
+    if (serr != CKB_OK) { free(wit_buf); return CKBFS_ERR_SIGN; }
 
-    // 8. Build WitnessArgs[0] hex (the signed witness)
-    uint8_t wa[CKB_WITNESS_ARGS_LEN];
+    // ── 7. Build witness hex strings ──────────────────────────────
+    // WitnessArgs[0]: signed secp256k1 witness
+    uint8_t wa[CKB_WITNESS_ARGS_LEN] = {};
     CKBSigner::buildWitnessWithSig(tx.signature, wa);
-    static char s_wa_hex[2 + CKB_WITNESS_ARGS_LEN*2 + 2];
-    s_wa_hex[0] = '0'; s_wa_hex[1] = 'x';
-    bytes_to_hex(wa, CKB_WITNESS_ARGS_LEN, s_wa_hex + 2);
+    char *wa_hex = (char *)malloc(2 + CKB_WITNESS_ARGS_LEN*2 + 1);
+    if (!wa_hex) { free(wit_buf); return CKBFS_ERR_NO_MEM; }
+    wa_hex[0]='0'; wa_hex[1]='x';
+    bytes_to_hex(wa, CKB_WITNESS_ARGS_LEN, wa_hex+2);
 
-    // 9. Custom broadcast with two witnesses
-    // Reuse CKBClient internals via a manual RPC call built from the tx
-    // Build inputs/outputs/deps JSON strings then call send_transaction
-    char inputs_json[600] = "[";
+    // Witness[1]: CKBFS content witness
+    char *ckbfs_hex = (char *)malloc(2 + wit_len*2 + 1);
+    if (!ckbfs_hex) { free(wit_buf); free(wa_hex); return CKBFS_ERR_NO_MEM; }
+    ckbfs_hex[0]='0'; ckbfs_hex[1]='x';
+    bytes_to_hex(wit_buf, wit_len, ckbfs_hex+2);
+    free(wit_buf); wit_buf = nullptr;
+
+    // Cell data for index cell
+    char *cdata_hex = (char *)malloc(2 + cell_data_len*2 + 1);
+    if (!cdata_hex) { free(wa_hex); free(ckbfs_hex); return CKBFS_ERR_NO_MEM; }
+    cdata_hex[0]='0'; cdata_hex[1]='x';
+    bytes_to_hex(cell_data, cell_data_len, cdata_hex+2);
+
+    // ── 8. Build JSON RPC body ────────────────────────────────────
+    // Use heap for large JSON buffers to avoid stack overflow
+    char *inputs_json = (char *)malloc(512);
+    if (!inputs_json) { free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
+    inputs_json[0]='['; inputs_json[1]='\0';
     for (uint8_t i = 0; i < tx.inputCount; i++) {
         char tmp[160];
         snprintf(tmp, sizeof(tmp),
             "%s{\"previous_output\":{\"tx_hash\":\"%s\",\"index\":\"0x%x\"},\"since\":\"0x0\"}",
             i > 0 ? "," : "", tx.inputs[i].txHash, tx.inputs[i].index);
-        strncat(inputs_json, tmp, sizeof(inputs_json) - strlen(inputs_json) - 1);
+        strncat(inputs_json, tmp, 512-strlen(inputs_json)-1);
     }
     strncat(inputs_json, "]", 2);
 
-    // Capacity as hex string
-    char cap_hex[20];
-    snprintf(cap_hex, sizeof(cap_hex), "0x%" PRIx64, change);
+    // outputs JSON: change + CKBFS index cell
+    char change_hex[20], cap_hex[20];
+    snprintf(change_hex, sizeof(change_hex), "0x%" PRIx64, change);
+    snprintf(cap_hex, sizeof(cap_hex), "0x%" PRIx64, cap_shannon);
 
-    char outputs_json[512];
-    snprintf(outputs_json, sizeof(outputs_json),
+    char *outputs_json = (char *)malloc(512);
+    if (!outputs_json) { free(inputs_json); free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
+    snprintf(outputs_json, 512,
         "[{\"capacity\":\"%s\","
-        "\"lock\":{\"code_hash\":\"%s\",\"hash_type\":\"%s\",\"args\":\"%s\"},"
-        "\"type\":null}]",
-        cap_hex, SECP256K1_CODE_HASH, SECP256K1_HASH_TYPE, lock_args);
+         "\"lock\":{\"code_hash\":\"%s\",\"hash_type\":\"%s\",\"args\":\"%s\"},"
+         "\"type\":null},"
+         "{\"capacity\":\"%s\","
+         "\"lock\":{\"code_hash\":\"%s\",\"hash_type\":\"%s\",\"args\":\"%s\"},"
+         "\"type\":null}]",
+        change_hex, SECP_CODE_HASH, SECP_HASH_TYPE, lock_args,
+        cap_hex, SECP_CODE_HASH, SECP_HASH_TYPE, lock_args);
 
-    // Allocate RPC body (large: contains full witness hex)
-    size_t body_size = 512 + 2 + wit_len * 2 + 2 + CKB_WITNESS_ARGS_LEN * 2 + 256;
-    char *body = (char *)malloc(body_size);
-    if (!body) return CKBFS_ERR_NO_MEM;
-
-    // deps JSON
-    char deps_json[200];
-    snprintf(deps_json, sizeof(deps_json),
+    char *deps_json = (char *)malloc(220);
+    if (!deps_json) { free(outputs_json); free(inputs_json); free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
+    snprintf(deps_json, 220,
         "[{\"out_point\":{\"tx_hash\":\"%s\",\"index\":\"0x0\"},\"dep_type\":\"dep_group\"}]",
-        tx.cellDeps[0].txHash);
+        SECP_DEP_TX);
+
+    // Assemble full body (heap: wa_hex + ckbfs_hex can be large)
+    size_t body_size = strlen(inputs_json) + strlen(outputs_json) + strlen(deps_json)
+                     + 2 + CKB_WITNESS_ARGS_LEN*2   // wa_hex
+                     + 2 + wit_len*2                 // ckbfs_hex
+                     + 2 + cell_data_len*2           // cdata_hex
+                     + 512;
+    char *body = (char *)malloc(body_size);
+    if (!body) { free(deps_json); free(outputs_json); free(inputs_json); free(wa_hex); free(ckbfs_hex); free(cdata_hex); return CKBFS_ERR_NO_MEM; }
 
     snprintf(body, body_size,
         "{\"jsonrpc\":\"2.0\",\"method\":\"send_transaction\","
@@ -352,15 +378,16 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
         "\"header_deps\":[],"
         "\"inputs\":%s,"
         "\"outputs\":%s,"
-        "\"outputs_data\":[\"0x\"],"
+        "\"outputs_data\":[\"0x\",\"%s\"],"
         "\"witnesses\":[\"%s\",\"%s\"]"
         "},\"passthrough\"],\"id\":1}",
         deps_json, inputs_json, outputs_json,
-        s_wa_hex, s_ckbfs_wit_hex);
+        cdata_hex, wa_hex, ckbfs_hex);
 
+    free(deps_json); free(outputs_json); free(inputs_json);
+    free(wa_hex); free(ckbfs_hex); free(cdata_hex);
 
-    // Send via CKBClient::broadcastRaw (handles tx hash extraction)
-    static char s_resp[256];
+    // ── 9. Broadcast ──────────────────────────────────────────────
     CKBError berr = CKBClient::broadcastRaw(node_url, body, tx_hash_out);
     free(body);
     return (berr == CKB_OK) ? CKBFS_OK : CKBFS_ERR_BROADCAST;

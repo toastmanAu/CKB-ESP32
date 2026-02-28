@@ -40,6 +40,9 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+// Forward declaration — full definition in CKBSigner.h (included by CKB.h)
+class CKBKey;
+
 // ── Sizes / limits ────────────────────────────────────────────────────────────
 #define CKBFS_MAGIC           "CKBFS"
 #define CKBFS_MAGIC_LEN       5
