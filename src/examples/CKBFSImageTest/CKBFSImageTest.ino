@@ -75,6 +75,7 @@
 #include <HTTPClient.h>
 #include <TFT_eSPI.h>
 #include <TJpgDec.h>
+#include <JPEGENC.h>
 #include "CKB.h"
 #include "CKBSigner.h"
 #include "ckbfs.h"
@@ -244,6 +245,89 @@ bool tg_send_photo(const uint8_t *jpeg, size_t len, const char *caption) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  JPEG COMPRESS — full resolution, quality reduction only
+//  Decode source JPEG → RGB565, re-encode at target quality.
+//  No resize: output has identical pixel dimensions to input.
+//  For 2752x1536: RGB565 buf = 2752*1536*2 = 8.5MB — needs PSRAM.
+//  CYD has no PSRAM, so we cap at a safe intermediate resolution.
+//  Strategy: TJpgDec decodes at 1/2 or 1/4 scale (still full quality
+//  visually for a 320x240 display), JPEGENC re-encodes at quality target.
+//  Output pixel dimensions = input / scale, but JPEG quality is reduced.
+// ═══════════════════════════════════════════════════════════════════
+
+// RGB565 capture buffer for re-encode
+static uint16_t *s_enc_rgb   = nullptr;
+static uint16_t  s_enc_cap_w = 0;
+static uint16_t  s_enc_cap_h = 0;
+
+bool enc_capture_block(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bmp) {
+    if (!s_enc_rgb) return false;
+    for (int row = 0; row < h && (y + row) < s_enc_cap_h; row++) {
+        memcpy(s_enc_rgb + (size_t)(y + row) * s_enc_cap_w + x,
+               bmp + row * w, w * sizeof(uint16_t));
+    }
+    return true;
+}
+
+// Decode JPEG at given TJpgDec scale (1/2/4/8), re-encode at quality.
+// Output: full-quality-compressed JPEG at input_res/scale dimensions.
+bool reencode_jpeg_fullres(const uint8_t *src, size_t src_len, int quality,
+                            uint8_t *out, size_t out_size, size_t *out_len)
+{
+    uint16_t iw, ih;
+    TJpgDec.setJpgScale(1);
+    TJpgDec.getJpgSize(&iw, &ih, src, src_len);
+    if (!iw || !ih) return false;
+
+    // Pick scale so RGB565 buffer fits in heap
+    // RGB565 bytes = w * h * 2
+    // Heap budget for this buffer: ~150KB (CYD has ~380KB usable, two 200KB img bufs already alloc'd)
+    // 2752x1536 / 8 = 344x192 = 132KB RGB565 — fits
+    // 2752x1536 / 4 = 688x384 = 528KB — too big
+    uint8_t scale = 1;
+    while (((uint32_t)(iw/scale) * (ih/scale) * 2) > 150 * 1024) scale *= 2;
+    if (scale > 8) scale = 8;
+    TJpgDec.setJpgScale(scale);
+    uint16_t ow = iw / scale, oh = ih / scale;
+
+    size_t rgb_bytes = (size_t)ow * oh * 2;
+    s_enc_rgb = (uint16_t *)malloc(rgb_bytes);
+    if (!s_enc_rgb) {
+        Serial.printf("[ENC] OOM for RGB565 (%zu bytes)\n", rgb_bytes);
+        return false;
+    }
+    memset(s_enc_rgb, 0, rgb_bytes);
+    s_enc_cap_w = ow; s_enc_cap_h = oh;
+
+    TJpgDec.setCallback(enc_capture_block);
+    TJpgDec.drawJpg(0, 0, src, src_len);
+
+    // Re-encode at target quality, same dimensions
+    JPEGENC jpg;
+    JPEGENCODE enc;
+    int buf_len = jpg.open(out, out_size);
+    if (!buf_len) { free(s_enc_rgb); s_enc_rgb = nullptr; return false; }
+
+    int rc = jpg.encodeBegin(&enc, ow, oh, JPEG_PIXEL_RGB565,
+                              JPEG_SUBSAMPLE_420, quality);
+    if (rc != JPEGE_SUCCESS) {
+        free(s_enc_rgb); s_enc_rgb = nullptr;
+        Serial.printf("[ENC] encodeBegin: %d\n", rc); return false;
+    }
+    rc = jpg.addFrame(&enc, (uint8_t *)s_enc_rgb, ow * sizeof(uint16_t));
+    if (rc != JPEGE_SUCCESS) {
+        free(s_enc_rgb); s_enc_rgb = nullptr;
+        Serial.printf("[ENC] addFrame: %d\n", rc); return false;
+    }
+    *out_len = jpg.close();
+    Serial.printf("[ENC] %dx%d (1/%d scale) Q%d -> %zu bytes\n",
+                  ow, oh, scale, quality, *out_len);
+
+    free(s_enc_rgb); s_enc_rgb = nullptr;
+    return *out_len > 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  CONFIRMATION POLL
 // ═══════════════════════════════════════════════════════════════════
 
@@ -286,12 +370,11 @@ void setup() {
         while (1) delay(1000);
     }
 
-    // Two buffers: src (download + upload) and chain (retrieved from chain)
-    // No re-encode step — upload original JPEG directly
+    // src: downloaded original; enc: compressed output; chain: retrieved from chain
     s_src_buf   = (uint8_t *)malloc(IMG_BUF_SIZE);
+    s_enc_buf   = (uint8_t *)malloc(IMG_BUF_SIZE);
     s_chain_buf = (uint8_t *)malloc(IMG_BUF_SIZE);
-    s_enc_buf   = s_src_buf;  // alias — enc == src, no copy needed
-    if (!s_src_buf || !s_chain_buf) {
+    if (!s_src_buf || !s_enc_buf || !s_chain_buf) {
         status(20, "OOM — reduce IMG_BUF_SIZE", TFT_RED);
         Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
         while (1) delay(1000);
@@ -339,12 +422,23 @@ void setup() {
     display_jpeg(s_src_buf, s_src_len, "Original");
     delay(2500);
 
-    // ── 3. SKIP RE-ENCODE — upload original JPEG as-is ──────────
-    // enc_buf aliases src_buf — no copy. CYD auto-scales on display.
-    t_encode_ms = 0;
-    s_enc_len = s_src_len;  // enc_buf == src_buf (aliased)
-    float ratio = 1.0f;
-    status(4, "3/8 Using original JPEG (no recompression)", TFT_GREEN);
+    // ── 3. COMPRESS — keep full resolution, reduce file size ─────
+    // Re-encode at IMAGE_QUALITY: smaller bytes on chain, same pixel dimensions.
+    // CYD TJpgDec will scale 2752x1536 → fits 320x240 automatically.
+    tft.fillScreen(TFT_BLACK);
+    snprintf(msg, sizeof(msg), "3/8 Compressing Q%d (full res)...", IMAGE_QUALITY);
+    status(4, msg);
+    t0 = millis();
+    if (!reencode_jpeg_fullres(s_src_buf, s_src_len, IMAGE_QUALITY,
+                               s_enc_buf, IMG_BUF_SIZE, &s_enc_len)) {
+        status(14, "Encode failed!", TFT_RED);
+        tg_send_text("❌ JPEG encode failed"); while (1) delay(1000);
+    }
+    t_encode_ms = millis() - t0;
+    float ratio = (float)s_src_len / s_enc_len;
+    snprintf(msg, sizeof(msg), "3/8 %zuKB->%zuKB (%.1fx) %ums",
+             s_src_len/1024, s_enc_len/1024, ratio, t_encode_ms);
+    status(14, msg, TFT_GREEN);
 
     // ── 4. COST ESTIMATE ─────────────────────────────────────────
     ckbfs_cost_t cost;
@@ -440,7 +534,7 @@ void setup() {
         "✅ Round-trip: %s",
         IMAGE_FILENAME,
         s_src_len,   s_src_len   / 1024.0f,
-        s_enc_len,   s_enc_len   / 1024.0f, IMAGE_QUALITY, ratio,
+        IMAGE_QUALITY, s_enc_len,   s_enc_len   / 1024.0f, ratio, IMAGE_QUALITY, ratio,
         s_tx_hash,
         t_download_ms, t_encode_ms, t_publish_ms,
         t_confirm_ms / 1000,
@@ -470,7 +564,8 @@ void setup() {
     tft.drawString(String(s_tx_hash).substring(0, 20) + "...", 4, 60);
 
     // Free buffers
-    free(s_src_buf);    // enc_buf aliases src_buf — do not free separately
+    free(s_src_buf);
+    free(s_enc_buf);
     free(s_chain_buf);
 }
 
