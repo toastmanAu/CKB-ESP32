@@ -5,6 +5,8 @@
 No relay. No cloud. No custodian. The chip does everything.
 
 [![Confirmed on Nervos Mainnet](https://img.shields.io/badge/mainnet-confirmed-brightgreen)](https://explorer.nervos.org/transaction/0x1db4d7677aaa03063ed87a6d927309b0ff4ce0bd18ec1f721432c11766f663d9)
+[![Host Tests](https://img.shields.io/badge/host%20tests-144%20passing-brightgreen)](test/REPORT.md)
+[![Platform](https://img.shields.io/badge/platform-Arduino%20%7C%20ESP--IDF%20%7C%20Linux-blue)](PORTING.md)
 
 ---
 

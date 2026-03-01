@@ -1,6 +1,6 @@
 # CKB-ESP32 Host Test Report
 
-**Date:** 2026-03-01 15:38  |  **Commit:** `18add39`  |  **Platform:** aarch64 Linux  |  **Compiler:** g++ 11.4.0
+**Date:** 2026-03-01 16:06  |  **Commit:** `5504432`  |  **Platform:** aarch64 Linux  |  **Compiler:** g++ 11.4.0
 22.04.3
 11.4.0
 
@@ -8,12 +8,12 @@
 
 | Suite | Passed | Failed | Time |
 |-------|--------|--------|------|
-| 🟢 blake2b | 12 | 0 | 0s |
+| 🟢 blake2b | 12 | 0 | 1s |
 | 🟢 molecule | 36 | 0 | 0s |
-| 🟢 bip39 | 20 | 0 | 2s |
-| 🟢 signer | 24 | 0 | 1s |
-| 🟢 client_static | 46 | 0 | 3s |
-| **Total** | **138** | **0** | 6s |
+| 🟢 bip39 | 20 | 0 | 1s |
+| 🟢 signer | 24 | 0 | 2s |
+| 🟢 client_static | 52 | 0 | 3s |
+| **Total** | **144** | **0** | 7s |
 
 ## Test Cases
 
@@ -147,7 +147,7 @@ PASS: blake2bCKB(empty) non-zero
 
 ### client_static
 
-<details><summary>✅ 46 passed, 0 failed</summary>
+<details><summary>✅ 52 passed, 0 failed</summary>
 
 ```
 PASS: 1.0 CKB = 100,000,000 shannon
@@ -195,6 +195,12 @@ PASS: CKB2021 bech32m decodes valid
 PASS: CKB2021: codeHash non-empty
 PASS: encodeAddress returns true
 PASS: re-encoded starts ckb1
+PASS: secp256k1 code_hash → CKB_LOCK_SECP256K1
+PASS: ACP code_hash → CKB_LOCK_ACP
+PASS: unknown code_hash → CKB_LOCK_UNKNOWN
+PASS: invalid script → CKB_LOCK_UNKNOWN
+PASS: CKB2021 full addr decodes
+PASS: JoyID-style unknown lock → CKB_LOCK_UNKNOWN
 PASS: nodeTypeStr returns non-empty string
 ```
 
