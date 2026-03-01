@@ -1,6 +1,6 @@
 # CKB-ESP32 Host Test Report
 
-**Date:** 2026-03-01 15:27  |  **Commit:** `24a957c`  |  **Platform:** aarch64 Linux  |  **Compiler:** g++ 11.4.0
+**Date:** 2026-03-01 15:32  |  **Commit:** `44240f6`  |  **Platform:** aarch64 Linux  |  **Compiler:** g++ 11.4.0
 22.04.3
 11.4.0
 
@@ -11,9 +11,9 @@
 | 🟢 blake2b | 12 | 0 | 0s |
 | 🟢 molecule | 36 | 0 | 0s |
 | 🟢 bip39 | 20 | 0 | 1s |
-| 🟢 signer | 24 | 0 | 1s |
-| 🟢 client_static | 37 | 0 | 3s |
-| **Total** | **129** | **0** | 5s |
+| 🟢 signer | 24 | 0 | 2s |
+| 🟢 client_static | 46 | 0 | 3s |
+| **Total** | **138** | **0** | 6s |
 
 ## Test Cases
 
@@ -147,7 +147,7 @@ PASS: blake2bCKB(empty) non-zero
 
 ### client_static
 
-<details><summary>✅ 37 passed, 0 failed</summary>
+<details><summary>✅ 46 passed, 0 failed</summary>
 
 ```
 PASS: 1.0 CKB = 100,000,000 shannon
@@ -177,15 +177,24 @@ PASS: empty hash rejected
 PASS: short hash rejected
 PASS: hash without 0x rejected
 PASS: hash with non-hex char rejected
-PASS: valid mainnet address
-PASS: valid testnet address
-PASS: NULL address rejected
-PASS: empty address rejected
+PASS: short secp256k1 addr (mainnet)
+PASS: old full bech32 addr
+PASS: CKB2021 full bech32m addr
+PASS: testnet short addr
+PASS: NULL rejected
+PASS: empty rejected
 PASS: non-CKB prefix rejected
-PASS: decodeAddress returns valid script
-PASS: codeHash non-empty
+PASS: short addr decodes valid
+PASS: short: codeHash non-empty
+PASS: short: hashType==type
+PASS: short: args contains lock_args
+PASS: old full bech32 decodes valid
+PASS: old full: codeHash non-empty
+PASS: old full: args contains lock_args
+PASS: CKB2021 bech32m decodes valid
+PASS: CKB2021: codeHash non-empty
 PASS: encodeAddress returns true
-PASS: re-encoded address starts ckb1
+PASS: re-encoded starts ckb1
 PASS: nodeTypeStr returns non-empty string
 ```
 

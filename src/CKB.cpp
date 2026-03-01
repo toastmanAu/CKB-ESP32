@@ -534,7 +534,9 @@ uint8_t CKBClient::_bech32CharToVal(char c) {
 }
 
 bool CKBClient::_bech32Decode(const char* addr, uint8_t* data, size_t& len, char* hrp) {
-    const char* sep = strrchr(addr, '1');
+    // HRP separator is the FIRST '1' — not last (data portion may contain '1')
+    // CKB HRP is always "ckb" or "ckt" (3 chars) so separator is at index 3
+    const char* sep = strchr(addr, '1');
     if (!sep || sep == addr) return false;
     size_t hrpLen = sep - addr;
     strncpy(hrp, addr, hrpLen); hrp[hrpLen] = '\0';
@@ -582,7 +584,7 @@ static const size_t _CKB_SHORT_ADDR_TABLE_LEN =
 
 CKBScript CKBClient::decodeAddress(const char* address) {
     CKBScript out; out.valid = false;
-    if (!address || strlen(address) < 46) return out;
+    if (!address || strlen(address) < 33) return out;  /* short addr minimum ~33 */
 
     uint8_t data[120]; size_t len = 0; char hrp[8];
     if (!_bech32Decode(address, data, len, hrp)) return out;

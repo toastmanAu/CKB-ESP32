@@ -93,32 +93,61 @@ int main(){
               "hash with non-hex char rejected","accepted");
     }
 
-    SECTION("isValidAddress");
+    SECTION("isValidAddress — all three formats");
     {
-        CHECK(CKBClient::isValidAddress(
-              "ckb1qqzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqthw9h047vf94pxju85lkq8zsjn4mehvfgr96r"),
-              "valid mainnet address","rejected");
-        CHECK(CKBClient::isValidAddress(
-              "ckt1qqzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqthw9h047vf94pxju85lkq8zsjn4mehvfgr96r"),
-              "valid testnet address","rejected");
+        // Short (deprecated bech32, fmt=0x01)
+        CHECK(CKBClient::isValidAddress("ckb1qyq829u0x32fchlfe5dqc4awh5q70h0eyj0q2zdh7f"),
+              "short secp256k1 addr (mainnet)","rejected");
+        // Old full (deprecated bech32, fmt=0x00)
+        CHECK(CKBClient::isValidAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8s3d5s64"),
+              "old full bech32 addr","rejected");
+        // CKB2021 full (bech32m, fmt=0x00)
+        CHECK(CKBClient::isValidAddress("ckb1qqzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqthw9h047vf94pxju85lkq8zsjn4mehvfgr96r"),
+              "CKB2021 full bech32m addr","rejected");
+        // Testnet
+        CHECK(CKBClient::isValidAddress("ckt1qyq829u0x32fchlfe5dqc4awh5q70h0eyj0q2zdh7f"),
+              "testnet short addr","rejected");
         CHECK(!CKBClient::isValidAddress(NULL),
-              "NULL address rejected","accepted");
+              "NULL rejected","accepted");
         CHECK(!CKBClient::isValidAddress(""),
-              "empty address rejected","accepted");
+              "empty rejected","accepted");
         CHECK(!CKBClient::isValidAddress("btc1qshortaddr"),
               "non-CKB prefix rejected","accepted");
     }
 
-    SECTION("decodeAddress + encodeAddress round-trip");
+    SECTION("decodeAddress — all three formats");
     {
-        const char* addr="ckb1qqzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqthw9h047vf94pxju85lkq8zsjn4mehvfgr96r";
-        CKBScript s = CKBClient::decodeAddress(addr);
-        CHECK(s.valid,"decodeAddress returns valid script","invalid");
-        CHECK(strlen(s.codeHash)>10,"codeHash non-empty","empty");
-        char out[104]={};
-        CHECK(CKBClient::encodeAddress(s,out,sizeof(out),"ckb"),
+        // Short (bech32, fmt=0x01)
+        {
+            CKBScript sc = CKBClient::decodeAddress("ckb1qyq829u0x32fchlfe5dqc4awh5q70h0eyj0q2zdh7f");
+            CHECK(sc.valid,"short addr decodes valid","invalid");
+            CHECK(strlen(sc.codeHash)>10,"short: codeHash non-empty","empty");
+            CHECK(strcmp(sc.hashType,"type")==0,"short: hashType==type","wrong");
+            // args = lock_args (blake160 of pubkey)
+            CHECK(strstr(sc.args,"75178f34")!=NULL,"short: args contains lock_args","wrong args");
+        }
+        // Old full bech32 (fmt=0x00)
+        {
+            CKBScript sc = CKBClient::decodeAddress("ckb1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqt4z78ng4yutl5u6xsv27ht6q08mhujf8s3d5s64");
+            CHECK(sc.valid,"old full bech32 decodes valid","invalid");
+            CHECK(strlen(sc.codeHash)>10,"old full: codeHash non-empty","empty");
+            CHECK(strstr(sc.args,"75178f34")!=NULL,"old full: args contains lock_args","wrong args");
+        }
+        // CKB2021 full bech32m (fmt=0x00)
+        {
+            CKBScript sc = CKBClient::decodeAddress("ckb1qqzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqthw9h047vf94pxju85lkq8zsjn4mehvfgr96r");
+            CHECK(sc.valid,"CKB2021 bech32m decodes valid","invalid");
+            CHECK(strlen(sc.codeHash)>10,"CKB2021: codeHash non-empty","empty");
+        }
+    }
+    SECTION("encodeAddress round-trip");
+    {
+        // CKB2021 → encode → starts with ckb1
+        CKBScript sc = CKBClient::decodeAddress("ckb1qqzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqthw9h047vf94pxju85lkq8zsjn4mehvfgr96r");
+        char out[120]={};
+        CHECK(CKBClient::encodeAddress(sc,out,sizeof(out),"ckb"),
               "encodeAddress returns true","false");
-        CHECK(strncmp(out,"ckb1",4)==0,"re-encoded address starts ckb1","wrong prefix");
+        CHECK(strncmp(out,"ckb1",4)==0,"re-encoded starts ckb1","wrong prefix");
     }
 
     SECTION("nodeTypeStr");
