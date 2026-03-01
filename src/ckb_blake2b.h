@@ -145,3 +145,8 @@ static inline void ckb_blake2b_hash(const void* data, size_t len, uint8_t out[32
     ckb_blake2b_update(&ctx, data, len);
     ckb_blake2b_final(&ctx, out);
 }
+
+// Alias: ckb_blake2b_256(data, len, out32) — same as ckb_blake2b_hash
+static inline void ckb_blake2b_256(const void* data, size_t len, uint8_t out[32]) {
+    ckb_blake2b_hash(data, len, out);
+}

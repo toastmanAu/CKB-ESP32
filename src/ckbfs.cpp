@@ -86,7 +86,7 @@ static const char* rpc_post(const char *url, const char *body) {
     if (code != 200) { http.end(); _ckbfs_rpc_buf[0]='\0'; return ""; }
     String resp = http.getString();
     http.end();
-    strlcpy(_ckbfs_rpc_buf, resp, sizeof(_ckbfs_rpc_buf));
+    strlcpy(_ckbfs_rpc_buf, resp.c_str(), sizeof(_ckbfs_rpc_buf));
     return _ckbfs_rpc_buf;
 #else
     CKBTransport* t = CKBClient::_defaultTransport();
