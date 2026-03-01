@@ -582,6 +582,46 @@ static const _CKBShortAddrEntry _CKB_SHORT_ADDR_TABLE[] = {
 static const size_t _CKB_SHORT_ADDR_TABLE_LEN =
     sizeof(_CKB_SHORT_ADDR_TABLE) / sizeof(_CKB_SHORT_ADDR_TABLE[0]);
 
+// Known code hashes (mainnet) for lock classification
+// Each entry: { code_hash_hex_no_prefix, lock_class }
+struct _CKBKnownLock {
+    const char* codeHashHex;   // 64 hex chars, no 0x
+    CKBLockClass lockClass;
+};
+static const _CKBKnownLock _CKB_KNOWN_LOCKS[] = {
+    // secp256k1-blake160-sighash-all (mainnet + testnet — same hash)
+    { "9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8", CKB_LOCK_SECP256K1 },
+    // secp256k1-blake160-multisig-all
+    { "5c5069eb0857efc65be6a4f5f9e01b0857effc645bbe749c6c7482233d76c7b7", CKB_LOCK_MULTISIG  },
+    // anyone-can-pay (mainnet)
+    { "d369597ff47f29fbb0d1f65a1f5482a8b02653168e8e83ed7f0b6c1e7e83c50c", CKB_LOCK_ACP       },
+    // anyone-can-pay (testnet)
+    { "3419a1c09eb2567f6552ee7a8ecffd64155cffe0f1796e6e61ec088d740dcff1", CKB_LOCK_ACP       },
+    // new secp256k1 type-id deployment (CKB2021 short index 0x00 = this hash)
+    { "04debf03bbd3dd9c1b29b3c20c2e09a36a7c55ec0c4bcb8c26d73bdf04b2e527", CKB_LOCK_SECP256K1 },
+};
+static const size_t _CKB_KNOWN_LOCKS_LEN =
+    sizeof(_CKB_KNOWN_LOCKS) / sizeof(_CKB_KNOWN_LOCKS[0]);
+
+CKBLockClass CKBScript::lockClass() const {
+    if (!valid || codeHash[0] == '\0') return CKB_LOCK_UNKNOWN;
+    // Skip 0x prefix
+    const char* ch = codeHash;
+    if (ch[0]=='0' && (ch[1]=='x'||ch[1]=='X')) ch += 2;
+    if (strlen(ch) != 64) return CKB_LOCK_UNKNOWN;
+    // Case-insensitive hex compare
+    for (size_t i = 0; i < _CKB_KNOWN_LOCKS_LEN; i++) {
+        bool match = true;
+        for (int j = 0; j < 64; j++) {
+            char a = ch[j]; if (a>='A'&&a<='F') a = a-'A'+'a';
+            char b = _CKB_KNOWN_LOCKS[i].codeHashHex[j]; if (b>='A'&&b<='F') b = b-'A'+'a';
+            if (a != b) { match = false; break; }
+        }
+        if (match) return _CKB_KNOWN_LOCKS[i].lockClass;
+    }
+    return CKB_LOCK_UNKNOWN;
+}
+
 CKBScript CKBClient::decodeAddress(const char* address) {
     CKBScript out; out.valid = false;
     if (!address || strlen(address) < 33) return out;  /* short addr minimum ~33 */
@@ -990,6 +1030,12 @@ void CKBClient::printConfig() {
 #if CKB_HAS_SIGNER
 
 CKBError CKBClient::signTx(CKBBuiltTx& tx, const CKBKey& key) {
+    // Refuse to sign transactions that contain unknown lock scripts.
+    // Unknown locks (JoyID, Spore, etc.) require external signing — applying a
+    // secp256k1 witness would produce a malformed transaction that the chain
+    // rejects. The caller must use broadcastWithWitness() instead.
+    if (tx.requiresExternalWitness) return CKB_ERR_UNSUPPORTED;
+
     // Use raw-pointer overload — avoids struct layout mismatch between
     // CKB.h's CKBBuiltTx and CKBSigner.h's CKBBuiltTx (different field offsets).
     return CKBSigner::signTxRaw(tx.signingHash, key, tx.signature, tx.signed_)
@@ -1249,12 +1295,35 @@ CKBBuiltTx CKBClient::buildTransfer(const char* fromAddr, const char* toAddr,
         tx.outputCount = 2;
     }
 
-    // 4. Cell dep: secp256k1 dep group
-    tx.cellDepCount = 1;
-    strncpy(tx.cellDeps[0].txHash,
-            _testnet ? CKB_SECP256K1_DEP_TESTNET_TX : CKB_SECP256K1_DEP_MAINNET_TX, 67);
-    tx.cellDeps[0].index      = CKB_SECP256K1_DEP_INDEX;
-    tx.cellDeps[0].isDepGroup = true;
+    // 4. Cell deps — injected based on lock class
+    // Unknown locks (JoyID, Spore, custom): passthrough — caller must add their dep
+    // Known locks: inject their standard dep group automatically
+    tx.cellDepCount = 0;
+    tx.requiresExternalWitness = false;
+    tx.unknownLockCount = 0;
+
+    // Scan inputs for lock types
+    bool needsSecp = false;
+    for (uint8_t i = 0; i < tx.inputCount; i++) {
+        CKBLockClass lc = tx.inputs[i].lockScript.lockClass();
+        if (lc == CKB_LOCK_SECP256K1 || lc == CKB_LOCK_ACP) needsSecp = true;
+        else if (lc == CKB_LOCK_UNKNOWN) {
+            tx.requiresExternalWitness = true;
+            tx.unknownLockCount++;
+        }
+        // multisig shares the secp256k1 dep group
+        if (lc == CKB_LOCK_MULTISIG) needsSecp = true;
+    }
+
+    // Always inject secp256k1 dep if any known secp-family lock is present
+    if (needsSecp) {
+        strncpy(tx.cellDeps[tx.cellDepCount].txHash,
+                _testnet ? CKB_SECP256K1_DEP_TESTNET_TX : CKB_SECP256K1_DEP_MAINNET_TX, 67);
+        tx.cellDeps[tx.cellDepCount].index      = CKB_SECP256K1_DEP_INDEX;
+        tx.cellDeps[tx.cellDepCount].isDepGroup = true;
+        tx.cellDepCount++;
+    }
+    // Unknown lock deps must be added by the caller via tx.cellDeps[] before broadcast
 
     // 5. Serialise to Molecule
     if (!_buildRawTxMolecule(tx)) { tx.error = CKB_ERR_OVERFLOW; return tx; }

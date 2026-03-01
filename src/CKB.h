@@ -131,12 +131,27 @@ typedef enum {
 
 // ─── Core data structures ─────────────────────────────────────────────────────
 
+/** Lock script class — used to determine signing/dep injection strategy */
+enum CKBLockClass : uint8_t {
+    CKB_LOCK_UNKNOWN   = 0,  ///< Unknown/custom lock (JoyID, Spore, etc.) — external signing required
+    CKB_LOCK_SECP256K1 = 1,  ///< secp256k1-blake160-sighash-all (RFC 0024) — standard wallet
+    CKB_LOCK_MULTISIG  = 2,  ///< secp256k1-blake160-multisig-all (RFC 0022)
+    CKB_LOCK_ACP       = 3,  ///< anyone-can-pay (RFC 0026)
+};
+
 /** Script (lock/type) */
 struct CKBScript {
     char codeHash[67];   // 0x + 64 hex
     char hashType[8];    // "type" | "data" | "data1" | "data2"
     char args[131];      // 0x + up to 128 hex chars (common: 42 for secp256k1)
     bool valid;
+
+    /**
+     * Classify this lock script.
+     * Returns CKB_LOCK_UNKNOWN for any unrecognised code_hash — callers should
+     * treat these as passthrough (do not sign, do not inject deps).
+     */
+    CKBLockClass lockClass() const;
 };
 
 /** OutPoint — identifies a cell */
@@ -420,6 +435,18 @@ struct CKBBuiltTx {
     // ── Status ────────────────────────────────────────────────────────────────
     CKBError error;
     bool     valid;
+
+    /**
+     * True if any input uses an unrecognised lock script (JoyID, Spore, custom
+     * multisig, etc.). The transaction is built and serialised correctly, but
+     * cannot be signed by CKBSigner — the caller must supply witness bytes
+     * externally and use broadcastWithWitness().
+     *
+     * signingHash still contains the correct hash to sign (same algorithm).
+     * unknownLockCount tells you how many inputs need external witnesses.
+     */
+    bool    requiresExternalWitness;
+    uint8_t unknownLockCount;
 
     /**
      * Inject a secp256k1 signature (65 bytes: r[32]+s[32]+v[1]).

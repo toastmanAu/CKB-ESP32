@@ -1,6 +1,6 @@
 # CKB-ESP32 Host Test Report
 
-**Date:** 2026-03-01 15:32  |  **Commit:** `44240f6`  |  **Platform:** aarch64 Linux  |  **Compiler:** g++ 11.4.0
+**Date:** 2026-03-01 15:38  |  **Commit:** `18add39`  |  **Platform:** aarch64 Linux  |  **Compiler:** g++ 11.4.0
 22.04.3
 11.4.0
 
@@ -10,8 +10,8 @@
 |-------|--------|--------|------|
 | 🟢 blake2b | 12 | 0 | 0s |
 | 🟢 molecule | 36 | 0 | 0s |
-| 🟢 bip39 | 20 | 0 | 1s |
-| 🟢 signer | 24 | 0 | 2s |
+| 🟢 bip39 | 20 | 0 | 2s |
+| 🟢 signer | 24 | 0 | 1s |
 | 🟢 client_static | 46 | 0 | 3s |
 | **Total** | **138** | **0** | 6s |
 

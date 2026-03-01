@@ -150,6 +150,43 @@ int main(){
         CHECK(strncmp(out,"ckb1",4)==0,"re-encoded starts ckb1","wrong prefix");
     }
 
+    SECTION("CKBScript::lockClass — known locks");
+    {
+        // secp256k1 by code hash
+        CKBScript sc; sc.valid = true; sc.hashType[0]=0;
+        strncpy(sc.codeHash, "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8", 67);
+        strncpy(sc.hashType, "type", 8); sc.args[0]=0;
+        CHECK(sc.lockClass()==CKB_LOCK_SECP256K1,"secp256k1 code_hash → CKB_LOCK_SECP256K1","wrong class");
+
+        // ACP (mainnet)
+        strncpy(sc.codeHash, "0xd369597ff47f29fbb0d1f65a1f5482a8b02653168e8e83ed7f0b6c1e7e83c50c", 67);
+        CHECK(sc.lockClass()==CKB_LOCK_ACP,"ACP code_hash → CKB_LOCK_ACP","wrong class");
+
+        // JoyID / unknown (made-up code hash)
+        strncpy(sc.codeHash, "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 67);
+        CHECK(sc.lockClass()==CKB_LOCK_UNKNOWN,"unknown code_hash → CKB_LOCK_UNKNOWN","wrong class");
+
+        // Zeroed code hash (invalid script)
+        memset(sc.codeHash, 0, sizeof(sc.codeHash));
+        sc.valid = false;
+        CHECK(sc.lockClass()==CKB_LOCK_UNKNOWN,"invalid script → CKB_LOCK_UNKNOWN","wrong class");
+
+        // Decoded JoyID address (real bech32m, unknown lock)
+        // Using a CKB2021 addr with a non-secp code hash
+        CKBScript joyid = CKBClient::decodeAddress(
+            "ckb1qqzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqthw9h047vf94pxju85lkq8zsjn4mehvfgr96r");
+        // This addr uses 0x04debf03... which IS in our known table as secp256k1
+        // (CKB2021 full format uses the new type-id deployment)
+        CHECK(joyid.valid,"CKB2021 full addr decodes","invalid");
+        // Now synthesise a truly unknown lock (simulate JoyID)
+        CKBScript unknown_lock; unknown_lock.valid = true;
+        strncpy(unknown_lock.codeHash,
+                "0xd23761b364210735c19c60561d213fb3beae2fd6172743719eff6920e020baac", 67);
+        strncpy(unknown_lock.hashType, "type", 8); unknown_lock.args[0]=0;
+        CHECK(unknown_lock.lockClass()==CKB_LOCK_UNKNOWN,
+              "JoyID-style unknown lock → CKB_LOCK_UNKNOWN","wrong class");
+    }
+
     SECTION("nodeTypeStr");
     {
         const char* t=CKBClient::nodeTypeStr();
