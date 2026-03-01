@@ -155,7 +155,7 @@ static int _hd_derive_child(_HDNode *parent, uint32_t index, _HDNode *child) {
     bignum256 il, pk, n;
     bn_read_be(I, &il);
     bn_read_be(parent->key, &pk);
-    bn_read_be(secp256k1.order, &n);
+    n = secp256k1.order;  /* bignum256 direct copy — bn_read_be needs bytes */
 
     /* Check IL < n */
     if (bn_is_less(&n, &il) || bn_is_equal(&n, &il)) {

@@ -34,11 +34,13 @@
 
 #pragma once
 #ifdef ARDUINO
-  #include <Arduino.h>
+  #include <Arduino.h>  /* platform-specific — safe under ARDUINO guard */
 #endif
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
 
 // Forward declaration — full definition in CKBSigner.h (included by CKB.h)
 class CKBKey;
@@ -229,6 +231,7 @@ static inline ckbfs_err_t ckbfs_publish_string(
                          capacity_ckb, tx_hash_out);
 }
 
+#ifdef ARDUINO
 // ── Convenience: read into a String (Arduino only) ───────────────────────────
 #ifdef ARDUINO
 static inline ckbfs_err_t ckbfs_read_string(
@@ -246,6 +249,7 @@ static inline ckbfs_err_t ckbfs_read_string(
     }
     return e;
 }
+#endif // ARDUINO
 #endif
 
 
@@ -343,6 +347,7 @@ static inline void ckbfs_estimate_cost(size_t content_len,
  * Pretty-print a ckbfs_cost_t to Serial (Arduino) or stdout.
  * Shows capacity, fee, total, and current USD estimate if ckb_price_usd > 0.
  */
+#ifdef ARDUINO
 static inline void ckbfs_print_cost(const ckbfs_cost_t *c, double ckb_price_usd)
 {
 #ifdef ARDUINO
@@ -379,3 +384,12 @@ static inline void ckbfs_print_cost(const ckbfs_cost_t *c, double ckb_price_usd)
     printf("  Type script:  %s\n", c->use_type_script ? "yes (+65 CKB)" : "no (lock-only)");
 #endif
 }
+#else
+static inline void ckbfs_print_cost(const ckbfs_cost_t* c) {
+    printf("CKBFS Storage Cost:\n");
+    printf("  Cell size:    %u bytes\n", (unsigned)c->cell_bytes);
+    printf("  Witness size: %u bytes\n", (unsigned)c->witness_bytes);
+    printf("  Transactions: %u\n", (unsigned)c->tx_count);
+    printf("  Capacity:     %llu CKB (LOCKED FOREVER)\n", (unsigned long long)c->capacity_ckb);
+}
+#endif // ARDUINO

@@ -1,2 +1,7 @@
 .pio/
 *.o
+third_party/ArduinoJson
+test/test_*
+!test/test_*.cpp
+!test/test_*.sh
+test/*.o

@@ -1,3 +1,4 @@
+#include <inttypes.h>
 /*
  * ckbfs.cpp — CKBFS Protocol implementation for CKB-ESP32
  * =========================================================
@@ -15,7 +16,9 @@
 #include "CKB.h"
 #include "CKBSigner.h"
 #include "ckb_blake2b.h"
+#ifdef ARDUINO
 #include <HTTPClient.h>
+#endif
 #ifdef ARDUINO
   #include <esp_task_wdt.h>
   #define WDT_FEED() esp_task_wdt_reset()
@@ -70,16 +73,26 @@ static const char SECP_HASH_TYPE[] = "type";
 static const char SECP_DEP_TX[] =
     "0x71a7ba8fc96349fea0ed3a5c47992e3b4084b031a42264a018e0072e8172e46c";
 
-// ── Raw RPC helper (returns heap-alloc String, caller must check empty) ────────
-static String rpc_post(const char *url, const char *body) {
+// ── Raw RPC helper ────────────────────────────────────────────────────────────
+static char _ckbfs_rpc_buf[CKB_JSON_DOC_SIZE];
+
+static const char* rpc_post(const char *url, const char *body) {
+#ifdef ARDUINO
     HTTPClient http;
     http.begin(url);
     http.setTimeout(10000);
     http.addHeader("Content-Type", "application/json");
     int code = http.POST((uint8_t*)body, strlen(body));
-    String resp = (code == 200) ? http.getString() : String();
+    if (code != 200) { http.end(); _ckbfs_rpc_buf[0]='\0'; return ""; }
+    String resp = http.getString();
     http.end();
-    return resp;
+    strlcpy(_ckbfs_rpc_buf, resp, sizeof(_ckbfs_rpc_buf));
+    return _ckbfs_rpc_buf;
+#else
+    CKBTransport* t = CKBClient::_defaultTransport();
+    int n = t->rpc(url, body, _ckbfs_rpc_buf, sizeof(_ckbfs_rpc_buf), 10000);
+    return (n > 0) ? _ckbfs_rpc_buf : "";
+#endif
 }
 
 // ── Build CKBFS witness bytes ─────────────────────────────────────
@@ -146,13 +159,13 @@ ckbfs_err_t ckbfs_fetch_witness(const char *node_url,
         "{\"jsonrpc\":\"2.0\",\"method\":\"get_transaction\","
         "\"params\":[\"%s\"],\"id\":1}", tx_hash);
 
-    String resp = rpc_post(node_url, body);
-    if (resp.isEmpty()) return CKBFS_ERR_RPC;
+    const char* resp = rpc_post(node_url, body);
+    if (!resp || !resp[0]) return CKBFS_ERR_RPC;
 
     // Find witnesses array
-    int wi = resp.indexOf("\"witnesses\":[");
+    const char* _wi_ptr = strstr(resp, "\"witnesses\":["); int wi = _wi_ptr ? (int)(_wi_ptr - resp) : -1;
     if (wi < 0) return CKBFS_ERR_NOT_FOUND;
-    const char *p = resp.c_str() + wi + strlen("\"witnesses\":[");
+    const char *p = resp + wi + strlen("\"witnesses\":[");
 
     // Skip to wit_index-th element
     uint32_t idx = 0;
@@ -246,7 +259,11 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
 
     uint64_t cap_shannon = capacity_ckb * 100000000ULL;
     uint64_t fee_shannon = (uint64_t)(wit_len + 1000);
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] collectInputCells, need %llu shannon\n", cap_shannon + fee_shannon);
+
+    #endif
 
     CKBTxInput inputs[CKB_TX_MAX_INPUTS] = {};
     uint8_t input_count = 0;
@@ -256,7 +273,11 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
                                            inputs, input_count, total_input);
     if (cerr != CKB_OK) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
     if (total_input < cap_shannon + fee_shannon) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] got %u inputs, total %llu shannon\n", input_count, total_input);
+
+    #endif
 
     // ── 4. Build CKBFS index cell data ────────────────────────────
     ckbfs_meta_t meta = {};
@@ -304,9 +325,13 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
     tx.outputCount = 2;
 
     // ── 6. Sign ───────────────────────────────────────────────────
-    CKBError serr = CKBClient::signTx(tx, key);
+    bool serr = CKBSigner::signTx(tx, key);
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] signTx: %d\n", (int)serr);
-    if (serr != CKB_OK) { free(wit_buf); return CKBFS_ERR_SIGN; }
+
+    #endif
+    if (!serr) { free(wit_buf); return CKBFS_ERR_SIGN; }
 
     // ── 7. Build witness hex strings ──────────────────────────────
     // WitnessArgs[0]: signed secp256k1 witness
@@ -394,7 +419,11 @@ ckbfs_err_t ckbfs_publish(const char *node_url,
 
     // ── 9. Broadcast ──────────────────────────────────────────────
     CKBError berr = CKBClient::broadcastRaw(node_url, body, tx_hash_out);
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] broadcastRaw: %d\n", (int)berr);
+
+    #endif
     free(body);
     return (berr == CKB_OK) ? CKBFS_OK : CKBFS_ERR_BROADCAST;
 }
@@ -430,8 +459,12 @@ ckbfs_err_t ckbfs_publish_with_input(const char *node_url,
     uint64_t fee_shannon  = (uint64_t)(wit_len + 1000);
     uint64_t total_input  = input_capacity_shannon;
 
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] using pre-specified input: %s[%u] = %llu shannon\n",
                   input_tx_hash, input_index, total_input);
+
+    #endif
 
     if (total_input < cap_shannon + fee_shannon) { free(wit_buf); return CKBFS_ERR_CAPACITY; }
 
@@ -481,7 +514,11 @@ ckbfs_err_t ckbfs_publish_with_input(const char *node_url,
     if (!ckb_signer.prepareForSigning(tx)) {
         free(wit_buf); free(txp); return CKBFS_ERR_SIGN;
     }
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] txHash: %.16s...\n", tx.txHashHex);
+
+    #endif
 
     // Rebuild signing hash including the CKBFS witness (wit_buf)
     {
@@ -503,14 +540,22 @@ ckbfs_err_t ckbfs_publish_with_input(const char *node_url,
         ckb_blake2b_update(&ctx, w1lenbuf, 8);
         ckb_blake2b_update(&ctx, wit_buf, wit_len);
         ckb_blake2b_final(&ctx, tx.signingHash);
+        #ifdef ARDUINO
+
         Serial.printf("[CKBFS] sigHash: %02x%02x%02x%02x...\n",
                       tx.signingHash[0], tx.signingHash[1],
                       tx.signingHash[2], tx.signingHash[3]);
+
+        #endif
     }
 
-    CKBError serr = CKBClient::signTx(tx, key);
+    bool serr = CKBSigner::signTx(tx, key);
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] signTx: %d\n", (int)serr);
-    if (serr != CKB_OK) { free(wit_buf); free(txp); return CKBFS_ERR_SIGN; }
+
+    #endif
+    if (!serr) { free(wit_buf); free(txp); return CKBFS_ERR_SIGN; }
 
     uint8_t wa[CKB_WITNESS_ARGS_LEN] = {};
     CKBSigner::buildWitnessWithSig(tx.signature, wa);
@@ -574,9 +619,17 @@ ckbfs_err_t ckbfs_publish_with_input(const char *node_url,
     free(deps_json); free(outputs_json); free(inputs_json);
     free(wa_hex); free(ckbfs_hex); free(cdata_hex);
 
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] body size: %u\n", (unsigned)strlen(body));
+
+    #endif
     CKBError berr = CKBClient::broadcastRaw(node_url, body, tx_hash_out);
+    #ifdef ARDUINO
+
     Serial.printf("[CKBFS] broadcastRaw: %d\n", (int)berr);
+
+    #endif
     free(body);
     return (berr == CKB_OK) ? CKBFS_OK : CKBFS_ERR_BROADCAST;
 }

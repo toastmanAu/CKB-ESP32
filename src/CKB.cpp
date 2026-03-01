@@ -5,6 +5,30 @@
 
 #include "CKB.h"
 
+/* ── Platform compat ─────────────────────────────────────────────────────── */
+#ifndef ARDUINO
+#include <stdio.h>
+#include <stdlib.h>
+#ifndef strlcpy
+static inline size_t strlcpy(char* dst, const char* src, size_t size) {
+    size_t i = 0;
+    if (size > 0) {
+        for (; i < size - 1 && src[i]; i++) dst[i] = src[i];
+        dst[i] = '\0';
+    }
+    while (src[i]) i++;
+    return i;
+}
+#endif
+#ifndef strlcat
+static inline size_t strlcat(char* dst, const char* src, size_t size) {
+    size_t dlen = 0;
+    while (dlen < size && dst[dlen]) dlen++;
+    return dlen + strlcpy(dst + dlen, src, size > dlen ? size - dlen : 0);
+}
+#endif
+#endif // !ARDUINO
+
 // ─── Constructor ──────────────────────────────────────────────────────────────
 
 CKBClient::CKBClient(const char* nodeUrl, const char* indexerUrl, bool testnet) {
@@ -35,6 +59,7 @@ CKBClient::CKBClient(const char* nodeUrl, const char* indexerUrl, bool testnet) 
     _debug        = false;
     _lastError    = CKB_OK;
     _rpcId        = 1;
+    _transport    = _defaultTransport();
 }
 
 const char* CKBClient::lastErrorStr() const {
@@ -54,34 +79,31 @@ const char* CKBClient::lastErrorStr() const {
 }
 
 void CKBClient::_debugPrint(const char* msg) {
+#ifdef ARDUINO
     if (_debug) Serial.println(msg);
+#else
+    if (_debug) printf("[CKB] %s\n", msg);
+#endif
 }
 
 // ─── Internal RPC call ────────────────────────────────────────────────────────
 
 bool CKBClient::_rpcCall(const char* url, const char* method,
                           const char* params, JsonDocument& doc) {
-    HTTPClient http;
-    http.begin(url);
-    http.setTimeout(_timeoutMs);
-    http.addHeader("Content-Type", "application/json");
-
     char body[640];
     snprintf(body, sizeof(body),
         "{\"id\":%d,\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":%s}",
         _rpcId++, method, params ? params : "[]");
     _debugPrint(body);
 
-    int code = http.POST(body);
-    if (code < 0 || code != 200) {
-        _lastError = (code == -1) ? CKB_ERR_TIMEOUT : CKB_ERR_HTTP;
-        http.end(); return false;
-    }
+    /* Delegate HTTP to the platform transport */
+    static char _respBuf[CKB_JSON_DOC_SIZE];
+    int n = _transport->rpc(url, body, _respBuf, sizeof(_respBuf), _timeoutMs);
+    if (n == CKB_TRANSPORT_TIMEOUT)   { _lastError = CKB_ERR_TIMEOUT; return false; }
+    if (n == CKB_TRANSPORT_BUF_SMALL) { _lastError = CKB_ERR_JSON;    return false; }
+    if (n < 0)                         { _lastError = CKB_ERR_HTTP;    return false; }
 
-    String payload = http.getString();
-    http.end();
-
-    DeserializationError err = deserializeJson(doc, payload);
+    DeserializationError err = deserializeJson(doc, _respBuf);
     if (err) { _lastError = CKB_ERR_JSON; return false; }
     if (doc.containsKey("error")) { _lastError = CKB_ERR_RPC; return false; }
     if (doc["result"].isNull()) { _lastError = CKB_ERR_NOT_FOUND; return false; }
@@ -90,7 +112,7 @@ bool CKBClient::_rpcCall(const char* url, const char* method,
     return true;
 }
 
-// ─── Parsers ──────────────────────────────────────────────────────────────────
+// ─── Parsers// ─── Parsers ──────────────────────────────────────────────────────────────────
 
 void CKBClient::_parseScript(JsonObject obj, CKBScript& out) {
     out.valid = false;
@@ -838,35 +860,24 @@ void CKBClient::uint64ToHex(uint64_t val, char* buf) {
     snprintf(buf, 19, "0x%llx", (unsigned long long)val);
 }
 
-String CKBClient::formatCKB(uint64_t shannon) {
-    uint64_t whole = shannon / CKB_SHANNON_PER_CKB;
-    uint64_t frac  = (shannon % CKB_SHANNON_PER_CKB) / 1000000; // 2 decimal places
-    char buf[32];
-    if (whole >= 1000000)
-        snprintf(buf, sizeof(buf), "%llu,%03llu,%03llu.%02llu CKB",
-            (unsigned long long)(whole/1000000),
-            (unsigned long long)((whole/1000)%1000),
-            (unsigned long long)(whole%1000),
-            (unsigned long long)frac);
-    else if (whole >= 1000)
-        snprintf(buf, sizeof(buf), "%llu,%03llu.%02llu CKB",
-            (unsigned long long)(whole/1000),
-            (unsigned long long)(whole%1000),
-            (unsigned long long)frac);
+char* CKBClient::formatCKB(uint64_t shannon, char* buf, size_t bufSize) {
+    uint64_t ckb  = shannon / CKB_SHANNON_PER_CKB;
+    uint64_t frac = (shannon % CKB_SHANNON_PER_CKB) / 100; // 6 decimal places
+    if (frac == 0)
+        snprintf(buf, bufSize, "%llu CKB", (unsigned long long)ckb);
     else
-        snprintf(buf, sizeof(buf), "%llu.%02llu CKB",
-            (unsigned long long)whole, (unsigned long long)frac);
-    return String(buf);
+        snprintf(buf, bufSize, "%llu.%06llu CKB",
+                 (unsigned long long)ckb, (unsigned long long)frac);
+    return buf;
 }
 
-String CKBClient::formatCKBCompact(uint64_t shannon) {
-    uint64_t ckb = shannon / CKB_SHANNON_PER_CKB;
-    char buf[24];
-    if      (ckb >= 1000000000) snprintf(buf, sizeof(buf), "%.1fB CKB", ckb / 1000000000.0);
-    else if (ckb >= 1000000)    snprintf(buf, sizeof(buf), "%.1fM CKB", ckb / 1000000.0);
-    else if (ckb >= 1000)       snprintf(buf, sizeof(buf), "%.1fK CKB", ckb / 1000.0);
-    else                        snprintf(buf, sizeof(buf), "%llu CKB", (unsigned long long)ckb);
-    return String(buf);
+char* CKBClient::formatCKBCompact(uint64_t shannon, char* buf, size_t bufSize) {
+    double ckb = (double)shannon / (double)CKB_SHANNON_PER_CKB;
+    if (ckb >= 1e9)       snprintf(buf, bufSize, "%.1fB CKB", ckb / 1e9);
+    else if (ckb >= 1e6)  snprintf(buf, bufSize, "%.1fM CKB", ckb / 1e6);
+    else if (ckb >= 1e3)  snprintf(buf, bufSize, "%.1fK CKB", ckb / 1e3);
+    else                  snprintf(buf, bufSize, "%.2f CKB", ckb);
+    return buf;
 }
 
 time_t CKBClient::msToTime(uint64_t timestampMs) {
@@ -875,28 +886,103 @@ time_t CKBClient::msToTime(uint64_t timestampMs) {
 
 // ─── printConfig ──────────────────────────────────────────────────────────────
 
+#ifdef ARDUINO
 void CKBClient::printConfig() {
+    #ifdef ARDUINO
+
     Serial.println(F("── CKB-ESP32 v" CKB_ESP32_VERSION " build config ──────────────────────────────"));
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Node type:     %s\n",   CKB_NODE_TYPE_STR);
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Block queries: %s\n",   CKB_HAS_BLOCK_QUERIES ? "YES" : "no");
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Peer queries:  %s\n",   CKB_HAS_PEER_QUERIES  ? "YES" : "no");
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Pool queries:  %s\n",   CKB_HAS_POOL_QUERIES  ? "YES" : "no");
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Indexer:       %s\n",   CKB_HAS_INDEXER       ? "YES" : "no");
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Send tx:       %s\n",   CKB_HAS_SEND_TX       ? "YES" : "no");
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Rich indexer:  %s\n",   CKB_HAS_RICH_INDEXER  ? "YES" : "no");
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Signer:        %s\n",   CKB_HAS_SIGNER        ? "YES" : "no");
+
+    #endif
 #ifdef CKB_NODE_LIGHT
+    #ifdef ARDUINO
+
     Serial.println("  Light client:  YES");
+
+    #endif
 #else
+    #ifdef ARDUINO
+
     Serial.println("  Light client:  no");
+
+    #endif
 #endif
+    #ifdef ARDUINO
+
     Serial.printf("  JSON buf:      %d bytes\n", CKB_JSON_DOC_SIZE);
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Max cells:     %d\n",        CKB_MAX_CELLS);
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Max txs:       %d\n",         CKB_MAX_TXS);
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  Max peers:     %d\n",         CKB_MAX_PEERS);
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.printf("  HTTP timeout:  %d ms\n",      CKB_HTTP_TIMEOUT_MS);
+
+    #endif
+    #ifdef ARDUINO
+
     Serial.println(F("─────────────────────────────────────────────────────────────────────────"));
+
+    #endif
 }
+#else
+void CKBClient::printConfig() {
+    printf("── CKB-ESP32 build config (host build) ──\n");
+    printf("  Node type: %s\n", CKB_NODE_TYPE_STR);
+}
+#endif // ARDUINO
 
 // ─── signTx (signer integration) ──────────────────────────────────────────────
 #if CKB_HAS_SIGNER
@@ -1185,26 +1271,23 @@ CKBBuiltTx CKBClient::buildTransfer(const char* fromAddr, const char* toAddr,
 bool CKBClient::_rpcCallStatic(const char* url, const char* method,
                                  const char* params, JsonDocument& doc,
                                  uint32_t timeoutMs) {
-    HTTPClient http;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(timeoutMs);
-
     char body[2800];
     snprintf(body, sizeof(body),
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}",
         method, params);
 
-    int code = http.POST(body);
-    if (code != 200) { http.end(); return false; }
+    static char _srbuf[CKB_JSON_DOC_SIZE];
+    CKBTransport* t = _defaultTransport();
+    int n = t->rpc(url, body, _srbuf, sizeof(_srbuf), timeoutMs);
+    if (n < 0) return false;
 
-    DeserializationError jerr = deserializeJson(doc, http.getString());
-    http.end();
+    DeserializationError jerr = deserializeJson(doc, _srbuf);
     if (jerr) return false;
     if (doc.containsKey("error")) return false;
     return true;
 }
 
+#if CKB_HAS_SIGNER
 // ── sendTransaction ───────────────────────────────────────────────────────────
 
 CKBError CKBClient::sendTransaction(const char* toAddr,
@@ -1322,7 +1405,11 @@ CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeU
                 // (we already have it from the tx itself — compute from raw_tx)
                 return CKB_OK;
             }
+            #ifdef ARDUINO
+
             Serial.printf("[CKB] send_transaction rejected: %s\n", msg);
+
+            #endif
         } else {
             /* _rpcCallStatic returned false but no error field in doc —
              * can happen when relay response triggers ArduinoJson parse edge case.
@@ -1340,6 +1427,7 @@ CKBError CKBClient::broadcastWithWitness(const CKBBuiltTx& tx, const char* nodeU
     if (txHashOut && strlen(hash) > 0) strncpy(txHashOut, hash, 67);
     return CKB_OK;
 }
+#endif // CKB_HAS_SIGNER
 
 #endif // CKB_HAS_SEND_TX
 
@@ -1612,7 +1700,7 @@ bool CKBClient::waitForSync(uint64_t targetBlock, uint32_t timeoutMs, uint32_t p
 
 #endif // CKB_NODE_LIGHT
 
-// ── broadcastRaw — send custom JSON-RPC body for CKBFS etc ────────────────────
+// ── broadcastRaw — send custom JSON-RPC body (CKBFS etc.) ───────────────────
 CKBError CKBClient::broadcastRaw(const char *node_url,
                                    const char *json_body,
                                    char *tx_hash_out,
@@ -1620,7 +1708,8 @@ CKBError CKBClient::broadcastRaw(const char *node_url,
 {
     if (!node_url || !json_body) return CKB_ERR_INVALID;
 
-    // Parse host and port from URL (e.g. "http://192.168.1.1:8114")
+#ifdef ARDUINO
+    /* Arduino: use explicit WiFiClient connect to avoid CYD/WiFi hang */
     const char *hostStart = strstr(node_url, "://");
     if (!hostStart) return CKB_ERR_INVALID;
     hostStart += 3;
@@ -1635,40 +1724,41 @@ CKBError CKBClient::broadcastRaw(const char *node_url,
     } else {
         strncpy(host, hostStart, sizeof(host)-1);
     }
-
-    // Explicit connect with 8s timeout — avoids indefinite hang on CYD WiFi
     WiFiClient wifiClient;
-    unsigned long t0 = millis();
-    if (!wifiClient.connect(host, port, 8000)) {
-        Serial.printf("[broadcast] connect timeout to %s:%u (%lums)\n", host, port, millis()-t0);
-        return CKB_ERR_HTTP;
-    }
-    Serial.printf("[broadcast] connected in %lums\n", millis()-t0);
-
+    if (!wifiClient.connect(host, port, 8000)) return CKB_ERR_HTTP;
     HTTPClient http;
     http.begin(wifiClient, node_url);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(timeoutMs > 0 ? timeoutMs : 20000);
+    http.setTimeout(timeoutMs > 0 ? (int)timeoutMs : 20000);
     int code = http.POST((uint8_t*)json_body, strlen(json_body));
-    Serial.printf("[broadcast] HTTP %d body_len=%u\n", code, (unsigned)strlen(json_body));
-    if (code != 200) {
-        String err = http.getString();
-        Serial.printf("[broadcast] err: %s\n", err.c_str());
-        http.end(); return CKB_ERR_HTTP;
-    }
+    if (code != 200) { http.end(); return CKB_ERR_HTTP; }
     String resp = http.getString();
-    Serial.printf("[broadcast] resp: %.120s\n", resp.c_str());
     http.end();
-
-    // Extract tx hash from {"result":"0x..."}
     int idx = resp.indexOf("\"result\":\"0x");
     if (idx < 0) return CKB_ERR_RPC;
     idx += strlen("\"result\":\"");
     if (tx_hash_out) {
         size_t i = 0;
-        while (idx+i < (int)resp.length() && resp[idx+i] != '"' && i < 66)
+        while (idx+(int)i < resp.length() && resp[idx+i] != '"' && i < 66)
             { tx_hash_out[i] = resp[idx+i]; i++; }
         tx_hash_out[i] = '\0';
     }
     return CKB_OK;
+#else
+    /* Non-Arduino: use platform transport */
+    static char _brbuf[CKB_JSON_DOC_SIZE];
+    CKBTransport* t = _defaultTransport();
+    int n = t->rpc(node_url, json_body, _brbuf, sizeof(_brbuf),
+                   timeoutMs > 0 ? timeoutMs : 20000);
+    if (n < 0) return CKB_ERR_HTTP;
+    const char* res = strstr(_brbuf, "\"result\":\"0x");
+    if (!res) return CKB_ERR_RPC;
+    res += strlen("\"result\":\"");
+    if (tx_hash_out) {
+        size_t i = 0;
+        while (res[i] && res[i] != '"' && i < 66) { tx_hash_out[i] = res[i]; i++; }
+        tx_hash_out[i] = '\0';
+    }
+    return CKB_OK;
+#endif
 }

@@ -48,15 +48,45 @@
  * Author:  toastmanAu  (Phill)
  * Repo:    https://github.com/toastmanAu/CKB-ESP32
  * License: MIT
+ *
+ * ── Platform compatibility ───────────────────────────────────────────────────
+ * This library is platform-agnostic. The crypto/molecule/BIP39 core has zero
+ * platform dependencies. The RPC transport is swappable:
+ *
+ *   Arduino / PlatformIO  →  CKBArduinoTransport  (auto-selected)
+ *   ESP-IDF               →  CKBIDFTransport       (auto-selected)
+ *   Linux / macOS / host  →  CKBPosixTransport     (auto-selected)
+ *   Unit tests            →  CKBMockTransport       (inject via setTransport)
+ *
+ * Override: call CKBClient::setTransport(&myTransport) after construction.
  */
 
-#include <Arduino.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
-#include <WiFiClientSecure.h>
+/* ── Platform-specific includes (guarded) ──────────────────────────────────── */
+#ifdef ARDUINO
+  #include <Arduino.h>
+  #include <ArduinoJson.h>
+#elif defined(ESP_PLATFORM)
+  #include <freertos/FreeRTOS.h>
+  #include <esp_log.h>
+  #include "ArduinoJson.h"   /* bundled copy via lib_deps */
+#else
+  /* Host / Linux / macOS */
+  #include "compat/ArduinoJson.h"  /* thin shim in src/compat/ */
+#endif
+
 #include "ckb_blake2b.h"
 #include "ckb_molecule.h"
 #include "CKBConfig.h"   // node type, profiles, capability flags, buffer sizes
+#include "platform/CKBTransport.h"
+
+/* ── Auto-select transport ─────────────────────────────────────────────────── */
+#ifdef ARDUINO
+  #include "platform/CKBArduinoTransport.h"
+#elif defined(ESP_PLATFORM)
+  #include "platform/CKBIDFTransport.h"
+#else
+  #include "platform/CKBPosixTransport.h"
+#endif
 
 #if CKB_HAS_SIGNER
   // Included AFTER all CKB structs are defined (see bottom of class section)
@@ -445,6 +475,13 @@ public:
 
     // ── Configuration ─────────────────────────────────────────────────────────
     void setTimeoutMs(uint32_t ms) { _timeoutMs = ms; }
+
+    /**
+     * Override the RPC transport. Call after construction.
+     * CKBClient does NOT take ownership — caller manages lifetime.
+     * Pass nullptr to restore the platform default.
+     */
+    void setTransport(CKBTransport* t) { _transport = t ? t : _defaultTransport(); }
     void setDebug(bool enable)     { _debug = enable; }
     CKBError lastError()     const { return _lastError; }
     const char* lastErrorStr() const;
@@ -568,6 +605,8 @@ public:
     // ══════════════════════════════════════════════════════════════════════════
     //  TRANSACTION BUILDER + SEND
     // ══════════════════════════════════════════════════════════════════════════
+/* CKBKey forward decl — full definition in CKBSigner.h (included at bottom of this file) */
+class CKBKey;
 #if CKB_HAS_SEND_TX
 
     /**
@@ -733,10 +772,22 @@ public:
     static uint64_t hexToUint64(const char* hex);
     /** uint64 to hex string — buf must be >=19 bytes */
     static void uint64ToHex(uint64_t val, char* buf);
-    /** Format shannon as human-readable CKB string e.g. "1,234.56 CKB" */
-    static String formatCKB(uint64_t shannon);
-    /** Format shannon as compact string e.g. "1.2K CKB" */
-    static String formatCKBCompact(uint64_t shannon);
+    /**
+     * Format shannon as human-readable CKB string e.g. "1,234.56 CKB"
+     * buf must be >= 32 bytes. Returns buf for convenience.
+     */
+    static char* formatCKB(uint64_t shannon, char* buf, size_t bufSize);
+    /**
+     * Format shannon as compact string e.g. "1.2K CKB"
+     * buf must be >= 24 bytes. Returns buf for convenience.
+     */
+    static char* formatCKBCompact(uint64_t shannon, char* buf, size_t bufSize);
+
+#ifdef ARDUINO
+    /** Arduino convenience: returns a String (allocates heap) */
+    static String formatCKBStr(uint64_t shannon)  { char b[32]; return String(formatCKB(shannon,b,sizeof(b))); }
+    static String formatCKBCompactStr(uint64_t s) { char b[24]; return String(formatCKBCompact(s,b,sizeof(b))); }
+#endif
     /** Timestamp (ms) to Arduino time_t */
     static time_t msToTime(uint64_t timestampMs);
     /** Is a tx hash valid format? (0x + 64 hex chars) */
@@ -817,6 +868,18 @@ private:
     bool _debug;
     CKBError _lastError;
     int _rpcId;
+    CKBTransport* _transport;  /* active transport — never null after construction */
+
+    public:
+    static CKBTransport* _defaultTransport() {
+#ifdef ARDUINO
+        static CKBArduinoTransport _ardu; return &_ardu;
+#elif defined(ESP_PLATFORM)
+        static CKBIDFTransport _idf;     return &_idf;
+#else
+        static CKBPosixTransport _posix; return &_posix;
+#endif
+    }
 
     // Tx builder helpers
     bool _buildRawTxMolecule(CKBBuiltTx& tx);

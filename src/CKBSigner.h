@@ -26,7 +26,10 @@
 #ifndef CKB_SIGNER_H
 #define CKB_SIGNER_H
 
+/* Arduino.h not required — CKBSigner has no Arduino-specific deps */
+#ifdef ARDUINO
 #include <Arduino.h>
+#endif
 #include <stdint.h>
 #include <stddef.h>
 
