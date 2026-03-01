@@ -267,10 +267,10 @@ static void _ckb_address_from_pubkey(const uint8_t *pubkey33, char *addr_out, si
 
     /* lock_args = blake2b(pubkey33)[0:20] */
     uint8_t hash[32];
-    blake2b_state bs;
-    blake2b_init(&bs, 32);
-    blake2b_update(&bs, pubkey33, 33);
-    blake2b_final(&bs, hash, 32);
+    CKB_Blake2b bs;
+    ckb_blake2b_init(&bs);
+    ckb_blake2b_update(&bs, pubkey33, 33);
+    ckb_blake2b_final(&bs, hash);
 
     /* Build address payload */
     uint8_t payload[54];
@@ -306,6 +306,8 @@ static bool _bip39_validate(const char *mnemonic) {
  *
  * IMPORTANT: zero privkey_hex after storing to NVS.
  */
+#define CKB_ADDRESS_BUFSIZE 104  /* safe buffer for full CKB bech32m address */
+
 static int ckb_mnemonic_to_privkey(
     const char *mnemonic,
     const char *passphrase,   /* "" for standard BIP39 */
@@ -337,10 +339,10 @@ static int ckb_mnemonic_to_privkey(
         snprintf(privkey_hex + i * 2, 3, "%02x", child.key[i]);
     privkey_hex[64] = '\0';
 
-    /* Step 5: derive address */
+    /* Step 5: derive address (optional — caller may pass NULL) */
     uint8_t pubkey[33];
     _pubkey_from_privkey(child.key, pubkey);
-    _ckb_address_from_pubkey(pubkey, address, 97);
+    if (address) _ckb_address_from_pubkey(pubkey, address, CKB_ADDRESS_BUFSIZE);
 
     /* Zero sensitive intermediates */
     memzero(&node,  sizeof(node));
@@ -366,9 +368,14 @@ static int ckb_privkey_to_address(const char *privkey_hex, char *address) {
         privkey[i] = (uint8_t)b;
     }
 
+    /* Reject zero key — invalid for secp256k1 */
+    bool all_zero = true;
+    for (int i = 0; i < 32; i++) if (privkey[i]) { all_zero = false; break; }
+    if (all_zero) { memzero(privkey, sizeof(privkey)); return -1; }
+
     uint8_t pubkey[33];
     _pubkey_from_privkey(privkey, pubkey);
-    _ckb_address_from_pubkey(pubkey, address, 97);
+    if (address) _ckb_address_from_pubkey(pubkey, address, CKB_ADDRESS_BUFSIZE);
 
     memzero(privkey, sizeof(privkey));
     memzero(pubkey, sizeof(pubkey));
